@@ -1,0 +1,46 @@
+# Build directories
+/build/
+/cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+Makefile
+compile_commands.json
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Runtime/local data
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# TLS/certificate material (local/dev)
+*.pem
+*.key
+*.crt
+*.p12
+*.der
+
+# Environment/local config
+.env
+.env.*
+
+# Editor/OS metadata
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
