@@ -14,7 +14,8 @@ void PrintUsage(const char* program) {
   std::cerr << "Usage: " << program
             << " [--host <host>] [--port <port>] [--tls-ca <pem>] "
                "[--tls-server-name <name>] [--tls-client-cert <pem>] "
-               "[--tls-client-key <pem>]\n";
+               "[--tls-client-key <pem>] [--tls-pin-sha256 <hex>] "
+               "[--register-token <token>] [--allow-insecure-dev]\n";
 }
 
 }  // namespace
@@ -26,6 +27,9 @@ int main(int argc, char** argv) {
   std::string tls_server_name;
   std::string tls_client_cert;
   std::string tls_client_key;
+  std::vector<std::string> tls_pins;
+  std::string registration_token;
+  bool allow_insecure_dev = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -82,6 +86,26 @@ int main(int argc, char** argv) {
       tls_client_key = argv[++i];
       continue;
     }
+    if (arg == "--tls-pin-sha256") {
+      if (i + 1 >= argc) {
+        PrintUsage(argv[0]);
+        return 1;
+      }
+      tls_pins.push_back(argv[++i]);
+      continue;
+    }
+    if (arg == "--register-token") {
+      if (i + 1 >= argc) {
+        PrintUsage(argv[0]);
+        return 1;
+      }
+      registration_token = argv[++i];
+      continue;
+    }
+    if (arg == "--allow-insecure-dev") {
+      allow_insecure_dev = true;
+      continue;
+    }
     PrintUsage(argv[0]);
     return 1;
   }
@@ -94,10 +118,16 @@ int main(int argc, char** argv) {
   pqchat::client::TlsClientConfig tls_config;
   tls_config.enabled = !tls_ca.empty() || !tls_server_name.empty() ||
                        !tls_client_cert.empty() || !tls_client_key.empty();
+  if (!allow_insecure_dev && !tls_config.enabled) {
+    std::cerr
+        << "TLS is required by default; configure TLS or use --allow-insecure-dev for local testing\n";
+    return 1;
+  }
   tls_config.ca_file = tls_ca;
   tls_config.server_name = tls_server_name;
   tls_config.client_cert_file = tls_client_cert;
   tls_config.client_key_file = tls_client_key;
+  tls_config.pinned_server_cert_sha256_hex = tls_pins;
 
   auto alice_result = pqchat::client::Client::Create("alice");
   auto bob_result = pqchat::client::Client::Create("bob");
@@ -117,6 +147,7 @@ int main(int argc, char** argv) {
       [&](const std::vector<uint8_t>& message) {
         return alice.SignTransportAuth(message);
       },
+      registration_token,
       tls_config);
 
   pqchat::client::TcpServerApi bob_api(
@@ -127,6 +158,7 @@ int main(int argc, char** argv) {
       [&](const std::vector<uint8_t>& message) {
         return bob.SignTransportAuth(message);
       },
+      registration_token,
       tls_config);
 
   auto publish_alice = alice.PublishPrekeys(&alice_api);

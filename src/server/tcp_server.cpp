@@ -1,12 +1,14 @@
 #include "pqchat/server/tcp_server.h"
 
 #include <cerrno>
+#include <cctype>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+#include <chrono>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -14,6 +16,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "pqchat/protocol/serialization.h"
@@ -32,23 +35,88 @@ std::string SslErrorString() {
   return std::string(buf);
 }
 
+void TrimWindow(std::deque<uint64_t>* bucket, uint64_t now, uint64_t window_seconds) {
+  while (!bucket->empty() && bucket->front() + window_seconds <= now) {
+    bucket->pop_front();
+  }
+}
+
+Result<void> CheckAndRecord(std::deque<uint64_t>* bucket,
+                            uint64_t now,
+                            uint64_t window_seconds,
+                            size_t limit,
+                            const char* error_text) {
+  TrimWindow(bucket, now, window_seconds);
+  if (bucket->size() >= limit) {
+    return Result<void>::Err(error_text);
+  }
+  bucket->push_back(now);
+  return Result<void>::Ok();
+}
+
+std::string PeerAddressString(int fd) {
+  sockaddr_storage peer{};
+  socklen_t len = sizeof(peer);
+  if (getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &len) != 0) {
+    return "unknown";
+  }
+
+  char host[INET6_ADDRSTRLEN] = {};
+  if (peer.ss_family == AF_INET) {
+    const auto* addr = reinterpret_cast<const sockaddr_in*>(&peer);
+    if (inet_ntop(AF_INET, &addr->sin_addr, host, sizeof(host)) != nullptr) {
+      return std::string(host);
+    }
+  } else if (peer.ss_family == AF_INET6) {
+    const auto* addr = reinterpret_cast<const sockaddr_in6*>(&peer);
+    if (inet_ntop(AF_INET6, &addr->sin6_addr, host, sizeof(host)) != nullptr) {
+      return std::string(host);
+    }
+  }
+  return "unknown";
+}
+
+bool IsValidUserIdForRateLimit(const std::string& user_id) {
+  if (user_id.empty() || user_id.size() > 64) {
+    return false;
+  }
+  for (unsigned char c : user_id) {
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+        c == '.') {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
-TcpServer::TcpServer(IServerApi* api, uint16_t port, TlsServerConfig tls_config)
-    : api_(api), port_(port), tls_config_(std::move(tls_config)) {}
+TcpServer::TcpServer(IServerApi* api,
+                     uint16_t port,
+                     TlsServerConfig tls_config,
+                     PreAuthRateLimitConfig preauth_rate_limit_config,
+                     size_t max_active_connections,
+                     int client_io_timeout_seconds)
+    : api_(api),
+      port_(port),
+      tls_config_(std::move(tls_config)),
+      preauth_rate_limit_config_(std::move(preauth_rate_limit_config)),
+      max_active_connections_(max_active_connections),
+      client_io_timeout_seconds_(client_io_timeout_seconds) {}
 
 Result<void> TcpServer::Run() {
   if (api_ == nullptr) {
     return Result<void>::Err("server api is null");
   }
 
-  std::unique_ptr<SSL_CTX, decltype(&SSL_CTX_free)> tls_ctx(nullptr, SSL_CTX_free);
+  std::shared_ptr<SSL_CTX> tls_ctx;
   if (tls_config_.enabled) {
     SSL_CTX* raw_ctx = SSL_CTX_new(TLS_server_method());
     if (!raw_ctx) {
       return Result<void>::Err("SSL_CTX_new failed: " + SslErrorString());
     }
-    tls_ctx.reset(raw_ctx);
+    tls_ctx = std::shared_ptr<SSL_CTX>(raw_ctx, SSL_CTX_free);
 
 #ifdef TLS1_3_VERSION
     if (SSL_CTX_set_min_proto_version(tls_ctx.get(), TLS1_3_VERSION) != 1) {
@@ -114,11 +182,45 @@ Result<void> TcpServer::Run() {
       close(listen_fd);
       return Result<void>::Err("accept failed: " + std::string(strerror(errno)));
     }
+    accepted_connections_.fetch_add(1, std::memory_order_relaxed);
 
-    std::thread([this, client_fd, ctx = tls_ctx.get()]() {
+    if (max_active_connections_ > 0 &&
+        active_connections_.load(std::memory_order_relaxed) >=
+            max_active_connections_) {
+      close(client_fd);
+      continue;
+    }
+
+    if (client_io_timeout_seconds_ > 0) {
+      timeval timeout{};
+      timeout.tv_sec = client_io_timeout_seconds_;
+      timeout.tv_usec = 0;
+      if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                     sizeof(timeout)) != 0 ||
+          setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                     sizeof(timeout)) != 0) {
+        close(client_fd);
+        continue;
+      }
+    }
+
+    active_connections_.fetch_add(1, std::memory_order_relaxed);
+    const std::string peer_addr = PeerAddressString(client_fd);
+    std::thread([this, client_fd, tls_ctx, peer_addr]() {
+      struct ActiveConnectionGuard {
+        explicit ActiveConnectionGuard(std::atomic<size_t>* counter)
+            : counter_(counter) {}
+        ~ActiveConnectionGuard() {
+          if (counter_ != nullptr) {
+            counter_->fetch_sub(1, std::memory_order_relaxed);
+          }
+        }
+        std::atomic<size_t>* counter_ = nullptr;
+      } guard(&active_connections_);
+
       std::unique_ptr<SSL, decltype(&SSL_free)> ssl(nullptr, SSL_free);
-      if (ctx != nullptr) {
-        SSL* raw_ssl = SSL_new(ctx);
+      if (tls_ctx) {
+        SSL* raw_ssl = SSL_new(tls_ctx.get());
         if (raw_ssl == nullptr) {
           close(client_fd);
           return;
@@ -132,7 +234,7 @@ Result<void> TcpServer::Run() {
         }
       }
 
-      HandleConnection(client_fd, ssl.get());
+      HandleConnection(client_fd, ssl.get(), peer_addr);
       if (ssl) {
         SSL_shutdown(ssl.get());
       }
@@ -141,7 +243,140 @@ Result<void> TcpServer::Run() {
   }
 }
 
-Result<void> TcpServer::HandleConnection(int fd, SSL* tls) {
+uint64_t TcpServer::NowUnix() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+Result<void> TcpServer::EnforcePreAuthRateLimit(uint32_t command,
+                                                const std::string& peer_addr) {
+  const bool is_register =
+      command == static_cast<uint32_t>(TcpCommand::kRegisterTransportIdentity);
+  const bool is_auth_begin = command == static_cast<uint32_t>(TcpCommand::kAuthBegin);
+  const bool is_auth_finish = command == static_cast<uint32_t>(TcpCommand::kAuthFinish);
+  if (!is_register && !is_auth_begin && !is_auth_finish) {
+    return Result<void>::Ok();
+  }
+
+  const uint64_t now = NowUnix();
+  std::scoped_lock lock(preauth_rate_mu_);
+
+  auto trim_map = [&](std::unordered_map<std::string, std::deque<uint64_t>>* buckets) {
+    for (auto it = buckets->begin(); it != buckets->end();) {
+      TrimWindow(&it->second, now, preauth_rate_limit_config_.window_seconds);
+      if (it->second.empty()) {
+        it = buckets->erase(it);
+      } else {
+        ++it;
+      }
+    }
+  };
+  trim_map(&preauth_register_by_addr_);
+  trim_map(&preauth_auth_begin_by_addr_);
+  trim_map(&preauth_auth_finish_by_addr_);
+  TrimWindow(&preauth_register_global_, now, preauth_rate_limit_config_.window_seconds);
+  TrimWindow(&preauth_auth_begin_global_, now, preauth_rate_limit_config_.window_seconds);
+  TrimWindow(&preauth_auth_finish_global_, now, preauth_rate_limit_config_.window_seconds);
+
+  if (is_register) {
+    auto per_addr = CheckAndRecord(&preauth_register_by_addr_[peer_addr],
+                                   now,
+                                   preauth_rate_limit_config_.window_seconds,
+                                   preauth_rate_limit_config_.register_per_addr,
+                                   "register rate limit exceeded (source address)");
+    if (!per_addr.ok()) {
+      return per_addr;
+    }
+    return CheckAndRecord(&preauth_register_global_,
+                          now,
+                          preauth_rate_limit_config_.window_seconds,
+                          preauth_rate_limit_config_.register_global,
+                          "register rate limit exceeded (global)");
+  }
+  if (is_auth_begin) {
+    auto per_addr = CheckAndRecord(&preauth_auth_begin_by_addr_[peer_addr],
+                                   now,
+                                   preauth_rate_limit_config_.window_seconds,
+                                   preauth_rate_limit_config_.auth_begin_per_addr,
+                                   "auth begin rate limit exceeded (source address)");
+    if (!per_addr.ok()) {
+      return per_addr;
+    }
+    return CheckAndRecord(&preauth_auth_begin_global_,
+                          now,
+                          preauth_rate_limit_config_.window_seconds,
+                          preauth_rate_limit_config_.auth_begin_global,
+                          "auth begin rate limit exceeded (global)");
+  }
+
+  auto per_addr = CheckAndRecord(&preauth_auth_finish_by_addr_[peer_addr],
+                                 now,
+                                 preauth_rate_limit_config_.window_seconds,
+                                 preauth_rate_limit_config_.auth_finish_per_addr,
+                                 "auth finish rate limit exceeded (source address)");
+  if (!per_addr.ok()) {
+    return per_addr;
+  }
+  return CheckAndRecord(&preauth_auth_finish_global_,
+                        now,
+                        preauth_rate_limit_config_.window_seconds,
+                        preauth_rate_limit_config_.auth_finish_global,
+                        "auth finish rate limit exceeded (global)");
+}
+
+Result<void> TcpServer::EnforcePreAuthUserRateLimit(uint32_t command,
+                                                    const std::string& peer_addr,
+                                                    const std::string& user_id) {
+  const bool is_register =
+      command == static_cast<uint32_t>(TcpCommand::kRegisterTransportIdentity);
+  const bool is_auth_begin = command == static_cast<uint32_t>(TcpCommand::kAuthBegin);
+  const bool is_auth_finish = command == static_cast<uint32_t>(TcpCommand::kAuthFinish);
+  if ((!is_register && !is_auth_begin && !is_auth_finish) || !IsValidUserIdForRateLimit(user_id)) {
+    return Result<void>::Ok();
+  }
+
+  const uint64_t now = NowUnix();
+  const std::string key = peer_addr + "|" + user_id;
+  std::scoped_lock lock(preauth_rate_mu_);
+  auto trim_map = [&](std::unordered_map<std::string, std::deque<uint64_t>>* buckets) {
+    for (auto it = buckets->begin(); it != buckets->end();) {
+      TrimWindow(&it->second, now, preauth_rate_limit_config_.window_seconds);
+      if (it->second.empty()) {
+        it = buckets->erase(it);
+      } else {
+        ++it;
+      }
+    }
+  };
+
+  trim_map(&preauth_register_by_addr_user_);
+  trim_map(&preauth_auth_begin_by_addr_user_);
+  trim_map(&preauth_auth_finish_by_addr_user_);
+
+  if (is_register) {
+    return CheckAndRecord(&preauth_register_by_addr_user_[key],
+                          now,
+                          preauth_rate_limit_config_.window_seconds,
+                          preauth_rate_limit_config_.register_per_addr_user,
+                          "register rate limit exceeded (source+user)");
+  }
+  if (is_auth_begin) {
+    return CheckAndRecord(&preauth_auth_begin_by_addr_user_[key],
+                          now,
+                          preauth_rate_limit_config_.window_seconds,
+                          preauth_rate_limit_config_.auth_begin_per_addr_user,
+                          "auth begin rate limit exceeded (source+user)");
+  }
+  return CheckAndRecord(&preauth_auth_finish_by_addr_user_[key],
+                        now,
+                        preauth_rate_limit_config_.window_seconds,
+                        preauth_rate_limit_config_.auth_finish_per_addr_user,
+                        "auth finish rate limit exceeded (source+user)");
+}
+
+Result<void> TcpServer::HandleConnection(int fd, SSL* tls, const std::string& peer_addr) {
   while (true) {
     auto frame = tls != nullptr ? ReadFrameTls(tls) : ReadFrame(fd);
     if (!frame.ok()) {
@@ -165,10 +400,21 @@ Result<void> TcpServer::HandleConnection(int fd, SSL* tls) {
       }
     };
 
+    auto preauth_limit = EnforcePreAuthRateLimit(command, peer_addr);
+    if (!preauth_limit.ok()) {
+      send_error(preauth_limit.error());
+      continue;
+    }
+
     if (command == static_cast<uint32_t>(TcpCommand::kRegisterTransportIdentity)) {
       auto request = protocol::DeserializeRegisterRequest(payload);
       if (!request.ok()) {
         send_error(request.error());
+        continue;
+      }
+      auto user_limit = EnforcePreAuthUserRateLimit(command, peer_addr, request.value().user_id);
+      if (!user_limit.ok()) {
+        send_error(user_limit.error());
         continue;
       }
       auto status = api_->RegisterTransportIdentity(request.value());
@@ -188,6 +434,11 @@ Result<void> TcpServer::HandleConnection(int fd, SSL* tls) {
       auto request = protocol::DeserializeAuthBeginRequest(payload);
       if (!request.ok()) {
         send_error(request.error());
+        continue;
+      }
+      auto user_limit = EnforcePreAuthUserRateLimit(command, peer_addr, request.value().user_id);
+      if (!user_limit.ok()) {
+        send_error(user_limit.error());
         continue;
       }
       auto response = api_->BeginTransportAuthentication(request.value());
@@ -212,6 +463,11 @@ Result<void> TcpServer::HandleConnection(int fd, SSL* tls) {
       auto request = protocol::DeserializeAuthFinishRequest(payload);
       if (!request.ok()) {
         send_error(request.error());
+        continue;
+      }
+      auto user_limit = EnforcePreAuthUserRateLimit(command, peer_addr, request.value().user_id);
+      if (!user_limit.ok()) {
+        send_error(user_limit.error());
         continue;
       }
       auto response = api_->FinishTransportAuthentication(request.value());
@@ -245,6 +501,21 @@ Result<void> TcpServer::HandleConnection(int fd, SSL* tls) {
     }
 
     const auto& inner_payload = authenticated_payload.value().payload;
+
+    if (command == static_cast<uint32_t>(TcpCommand::kLogout)) {
+      auto revoked =
+          api_->RevokeSessionToken(authenticated_payload.value().session_token);
+      if (!revoked.ok()) {
+        send_error(revoked.error());
+        continue;
+      }
+      if (tls != nullptr) {
+        WriteFrameTls(tls, static_cast<uint32_t>(TcpStatus::kOk), {});
+      } else {
+        WriteFrame(fd, static_cast<uint32_t>(TcpStatus::kOk), {});
+      }
+      continue;
+    }
 
     if (command == static_cast<uint32_t>(TcpCommand::kPublishBundle)) {
       auto bundle = protocol::DeserializePrekeyBundle(inner_payload);
@@ -305,12 +576,15 @@ Result<void> TcpServer::HandleConnection(int fd, SSL* tls) {
       }
 
       std::string sender;
+      std::string recipient;
       if (request.value().envelope.type == protocol::EnvelopeType::kInitial &&
           request.value().envelope.initial.has_value()) {
         sender = request.value().envelope.initial->from_user;
+        recipient = request.value().envelope.initial->to_user;
       } else if (request.value().envelope.type == protocol::EnvelopeType::kChat &&
                  request.value().envelope.chat.has_value()) {
         sender = request.value().envelope.chat->from_user;
+        recipient = request.value().envelope.chat->to_user;
       } else {
         send_error("invalid envelope sender");
         continue;
@@ -318,6 +592,10 @@ Result<void> TcpServer::HandleConnection(int fd, SSL* tls) {
 
       if (sender != session_user.value()) {
         send_error("envelope sender mismatch with authenticated session");
+        continue;
+      }
+      if (recipient != request.value().user_id) {
+        send_error("envelope recipient mismatch with enqueue target");
         continue;
       }
 
@@ -337,23 +615,24 @@ Result<void> TcpServer::HandleConnection(int fd, SSL* tls) {
     }
 
     if (command == static_cast<uint32_t>(TcpCommand::kDrainInbox)) {
-      auto requested_user = protocol::DeserializeString(inner_payload);
-      if (!requested_user.ok()) {
-        send_error(requested_user.error());
+      auto drain_request = protocol::DeserializeDrainInboxRequest(inner_payload);
+      if (!drain_request.ok()) {
+        send_error(drain_request.error());
         continue;
       }
-      if (requested_user.value() != session_user.value()) {
+      if (drain_request.value().user_id != session_user.value()) {
         send_error("drain user_id mismatch with authenticated session");
         continue;
       }
 
-      auto envelopes = api_->DrainInbox(session_user.value());
+      auto envelopes = api_->DrainInbox(session_user.value(),
+                                        drain_request.value().ack_up_to_inbox_id);
       if (!envelopes.ok()) {
         send_error(envelopes.error());
         continue;
       }
 
-      auto encoded = protocol::SerializeEnvelopeVector(envelopes.value());
+      auto encoded = protocol::SerializeInboxEnvelopeVector(envelopes.value());
       if (!encoded.ok()) {
         send_error(encoded.error());
         continue;

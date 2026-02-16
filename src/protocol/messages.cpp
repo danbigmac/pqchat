@@ -2,6 +2,7 @@
 
 #include "pqchat/crypto/hash.h"
 #include "pqchat/crypto/hkdf.h"
+#include "pqchat/protocol/prekey_bundle.h"
 
 namespace pqchat::protocol {
 namespace {
@@ -48,8 +49,11 @@ Result<std::vector<uint8_t>> ComputeInitialTranscriptHash(
     const InitialTranscriptFields& fields) {
   std::vector<uint8_t> canonical;
   AppendString(&canonical, "pqchat_initial_transcript_v1");
+  AppendString(&canonical, fields.session_id);
   AppendString(&canonical, fields.from_user);
   AppendString(&canonical, fields.to_user);
+  AppendString(&canonical, fields.version);
+  AppendString(&canonical, fields.cipher_suite);
 
   AppendBytes(&canonical, fields.initiator_identity_sign_public_key);
   AppendBytes(&canonical, fields.initiator_identity_mldsa_public_key);
@@ -76,6 +80,13 @@ Result<std::vector<uint8_t>> ComputeInitialTranscriptHash(
   AppendUint32(&canonical, fields.kem_ciphertext_one_time_pq.has_value() ? 1 : 0);
   if (fields.kem_ciphertext_one_time_pq.has_value()) {
     AppendBytes(&canonical, *fields.kem_ciphertext_one_time_pq);
+  }
+
+  if (fields.version != kProtocolVersion) {
+    return Result<std::vector<uint8_t>>::Err("unsupported initial message version");
+  }
+  if (fields.cipher_suite != kCipherSuite) {
+    return Result<std::vector<uint8_t>>::Err("unsupported initial message cipher suite");
   }
 
   return crypto::Sha256(canonical);

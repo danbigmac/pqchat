@@ -33,6 +33,10 @@ std::vector<uint8_t> ToTagged(const char* tag,
   return out;
 }
 
+void AppendString(std::vector<uint8_t>* out, const std::string& value) {
+  AppendWithLength(out, crypto::ToBytes(value));
+}
+
 }  // namespace
 
 std::vector<uint8_t> BuildEcPrekeySignInput(uint32_t key_id,
@@ -45,7 +49,37 @@ std::vector<uint8_t> BuildPqPrekeySignInput(uint32_t key_id,
   return ToTagged("pqchat_pq_prekey_v1", key_id, public_key);
 }
 
+std::vector<uint8_t> BuildBundleSignInput(const PrekeyBundle& bundle) {
+  std::vector<uint8_t> out;
+  AppendString(&out, "pqchat_bundle_sig_v2");
+  AppendString(&out, bundle.user_id);
+  AppendWithLength(&out, bundle.identity_sign_public_key);
+  AppendWithLength(&out, bundle.identity_mldsa_public_key);
+  AppendWithLength(&out, bundle.identity_dh_public_key);
+
+  AppendUint32(&out, bundle.signed_prekey_ec.id);
+  AppendWithLength(&out, bundle.signed_prekey_ec.public_key);
+  AppendWithLength(&out, bundle.signed_prekey_ec.signature_ed25519);
+  AppendWithLength(&out, bundle.signed_prekey_ec.signature_mldsa65);
+
+  AppendUint32(&out, bundle.signed_prekey_pq.id);
+  AppendWithLength(&out, bundle.signed_prekey_pq.public_key);
+  AppendWithLength(&out, bundle.signed_prekey_pq.signature_ed25519);
+  AppendWithLength(&out, bundle.signed_prekey_pq.signature_mldsa65);
+
+  AppendString(&out, bundle.version);
+  AppendString(&out, bundle.cipher_suite);
+  return out;
+}
+
 Result<void> VerifyPrekeyBundleSignatures(const PrekeyBundle& bundle) {
+  if (bundle.version != kProtocolVersion) {
+    return Result<void>::Err("unsupported bundle version");
+  }
+  if (bundle.cipher_suite != kCipherSuite) {
+    return Result<void>::Err("unsupported bundle cipher suite");
+  }
+
   auto ec_input = BuildEcPrekeySignInput(bundle.signed_prekey_ec.id,
                                          bundle.signed_prekey_ec.public_key);
   auto ec_verify = crypto::Ed25519::Verify(bundle.identity_sign_public_key,
@@ -80,6 +114,23 @@ Result<void> VerifyPrekeyBundleSignatures(const PrekeyBundle& bundle) {
   if (!pq_verify_mldsa.ok()) {
     return Result<void>::Err("signed_prekey_pq mldsa signature invalid: " +
                              pq_verify_mldsa.error());
+  }
+
+  auto bundle_sign_input = BuildBundleSignInput(bundle);
+  auto bundle_verify = crypto::Ed25519::Verify(bundle.identity_sign_public_key,
+                                               bundle_sign_input,
+                                               bundle.bundle_signature_ed25519);
+  if (!bundle_verify.ok()) {
+    return Result<void>::Err("bundle ed25519 signature invalid: " +
+                             bundle_verify.error());
+  }
+
+  auto bundle_verify_mldsa = crypto::MlDsa65::Verify(bundle.identity_mldsa_public_key,
+                                                     bundle_sign_input,
+                                                     bundle.bundle_signature_mldsa65);
+  if (!bundle_verify_mldsa.ok()) {
+    return Result<void>::Err("bundle mldsa signature invalid: " +
+                             bundle_verify_mldsa.error());
   }
 
   return Result<void>::Ok();

@@ -20,6 +20,8 @@ struct InitialMessage {
   std::string session_id;
   std::string from_user;
   std::string to_user;
+  std::string version;
+  std::string cipher_suite;
 
   std::vector<uint8_t> initiator_identity_sign_public_key;
   std::vector<uint8_t> initiator_identity_mldsa_public_key;
@@ -40,8 +42,11 @@ struct InitialMessage {
 };
 
 struct InitialTranscriptFields {
+  std::string session_id;
   std::string from_user;
   std::string to_user;
+  std::string version;
+  std::string cipher_suite;
 
   std::vector<uint8_t> initiator_identity_sign_public_key;
   std::vector<uint8_t> initiator_identity_mldsa_public_key;
@@ -87,6 +92,11 @@ struct Envelope {
 
   static Envelope FromInitial(InitialMessage message);
   static Envelope FromChat(ChatMessage message);
+};
+
+struct InboxEnvelope {
+  uint64_t inbox_id = 0;
+  Envelope envelope;
 };
 
 Result<std::vector<uint8_t>> ComputeInitialTranscriptHash(

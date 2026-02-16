@@ -23,6 +23,11 @@ struct MlKemEncapResult {
 class MlKem768 {
  public:
   static Result<MlKemKeyPair> GenerateKeyPair();
+  static Result<MlKemKeyPair> FromPrivateKey(
+      const std::vector<uint8_t>& private_key,
+      const std::vector<uint8_t>& public_key);
+
+  static Result<std::vector<uint8_t>> ExportPrivateKey(EVP_PKEY* private_key);
 
   static Result<MlKemEncapResult> Encapsulate(
       const std::vector<uint8_t>& public_key);

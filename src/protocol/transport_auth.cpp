@@ -43,4 +43,26 @@ std::vector<uint8_t> BuildTransportAuthSignInput(
   return out;
 }
 
+std::vector<uint8_t> BuildTransportRegisterSignInput(
+    const std::string& user_id,
+    const std::vector<uint8_t>& new_transport_auth_public_key) {
+  std::vector<uint8_t> out;
+  AppendString(&out, "pqchat_transport_register_v1");
+  AppendString(&out, user_id);
+  AppendBytes(&out, new_transport_auth_public_key);
+  return out;
+}
+
+std::vector<uint8_t> BuildTransportRegisterRotateSignInput(
+    const std::string& user_id,
+    const std::vector<uint8_t>& existing_transport_auth_public_key,
+    const std::vector<uint8_t>& new_transport_auth_public_key) {
+  std::vector<uint8_t> out;
+  AppendString(&out, "pqchat_transport_register_rotate_v1");
+  AppendString(&out, user_id);
+  AppendBytes(&out, existing_transport_auth_public_key);
+  AppendBytes(&out, new_transport_auth_public_key);
+  return out;
+}
+
 }  // namespace pqchat::protocol

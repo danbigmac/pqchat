@@ -18,26 +18,11 @@
 
 #include "pqchat/protocol/serialization.h"
 #include "pqchat/protocol/transport_auth.h"
+#include "pqchat/client/tls_pinning.h"
 #include "pqchat/server/tcp_wire.h"
 
 namespace pqchat::client {
 namespace {
-
-class FdGuard {
- public:
-  explicit FdGuard(int fd) : fd_(fd) {}
-  ~FdGuard() {
-    if (fd_ >= 0) {
-      close(fd_);
-    }
-  }
-
-  FdGuard(const FdGuard&) = delete;
-  FdGuard& operator=(const FdGuard&) = delete;
-
- private:
-  int fd_;
-};
 
 uint64_t NowUnix() {
   return static_cast<uint64_t>(
@@ -52,6 +37,26 @@ Result<std::vector<uint8_t>> RandomBytes(size_t len) {
     return Result<std::vector<uint8_t>>::Err("RAND_bytes failed");
   }
   return Result<std::vector<uint8_t>>::Ok(std::move(out));
+}
+
+Result<std::vector<uint8_t>> PeerCertificateSha256(SSL* ssl) {
+  if (ssl == nullptr) {
+    return Result<std::vector<uint8_t>>::Err("SSL pointer is null");
+  }
+
+  X509* raw_cert = SSL_get1_peer_certificate(ssl);
+  if (raw_cert == nullptr) {
+    return Result<std::vector<uint8_t>>::Err("server did not present a certificate");
+  }
+  std::unique_ptr<X509, decltype(&X509_free)> cert(raw_cert, X509_free);
+
+  std::vector<uint8_t> digest(EVP_MAX_MD_SIZE);
+  unsigned int digest_len = 0;
+  if (X509_digest(cert.get(), EVP_sha256(), digest.data(), &digest_len) != 1) {
+    return Result<std::vector<uint8_t>>::Err("failed computing server cert fingerprint");
+  }
+  digest.resize(digest_len);
+  return Result<std::vector<uint8_t>>::Ok(std::move(digest));
 }
 
 Result<int> ConnectTcp(const std::string& host, uint16_t port) {
@@ -155,83 +160,140 @@ TcpServerApi::TcpServerApi(std::string host,
                            std::string user_id,
                            std::vector<uint8_t> transport_auth_public_key,
                            SignFn sign_fn,
+                           std::string registration_token,
                            TlsClientConfig tls_config)
     : host_(std::move(host)),
       port_(port),
       user_id_(std::move(user_id)),
       transport_auth_public_key_(std::move(transport_auth_public_key)),
       sign_fn_(std::move(sign_fn)),
-      tls_config_(std::move(tls_config)) {}
+      registration_token_(std::move(registration_token)),
+      tls_config_(std::move(tls_config)),
+      tls_ctx_(nullptr, SSL_CTX_free),
+      tls_ssl_(nullptr, SSL_free) {}
+
+TcpServerApi::~TcpServerApi() {
+  CloseConnection();
+}
+
+void TcpServerApi::CloseConnection() {
+  if (tls_ssl_) {
+    SSL_shutdown(tls_ssl_.get());
+    tls_ssl_.reset();
+  }
+  tls_ctx_.reset();
+  if (fd_ >= 0) {
+    close(fd_);
+    fd_ = -1;
+  }
+}
+
+Result<void> TcpServerApi::EnsureConnected() {
+  if (fd_ >= 0) {
+    return Result<void>::Ok();
+  }
+
+  auto fd_result = ConnectTcp(host_, port_);
+  if (!fd_result.ok()) {
+    return Result<void>::Err(fd_result.error());
+  }
+  fd_ = fd_result.take_value();
+
+  if (!tls_config_.enabled) {
+    return Result<void>::Ok();
+  }
+
+  auto ctx_result = CreateClientTlsContext(tls_config_);
+  if (!ctx_result.ok()) {
+    CloseConnection();
+    return Result<void>::Err(ctx_result.error());
+  }
+  tls_ctx_ = ctx_result.take_value();
+
+  SSL* raw_ssl = SSL_new(tls_ctx_.get());
+  if (!raw_ssl) {
+    CloseConnection();
+    return Result<void>::Err("SSL_new failed: " + SslErrorString());
+  }
+  tls_ssl_.reset(raw_ssl);
+  SSL_set_fd(tls_ssl_.get(), fd_);
+
+  const std::string verify_name =
+      tls_config_.server_name.empty() ? host_ : tls_config_.server_name;
+  if (!verify_name.empty()) {
+    X509_VERIFY_PARAM* verify_param = SSL_get0_param(tls_ssl_.get());
+    in_addr ipv4{};
+    in6_addr ipv6{};
+    const bool is_ip = inet_pton(AF_INET, verify_name.c_str(), &ipv4) == 1 ||
+                       inet_pton(AF_INET6, verify_name.c_str(), &ipv6) == 1;
+    if (is_ip) {
+      if (X509_VERIFY_PARAM_set1_ip_asc(verify_param, verify_name.c_str()) != 1) {
+        CloseConnection();
+        return Result<void>::Err("failed to set TLS verify IP");
+      }
+    } else {
+      if (SSL_set_tlsext_host_name(tls_ssl_.get(), verify_name.c_str()) != 1) {
+        CloseConnection();
+        return Result<void>::Err("failed to set TLS SNI hostname");
+      }
+      if (X509_VERIFY_PARAM_set1_host(verify_param, verify_name.c_str(), 0) != 1) {
+        CloseConnection();
+        return Result<void>::Err("failed to set TLS verify hostname");
+      }
+    }
+  }
+
+  if (SSL_connect(tls_ssl_.get()) != 1) {
+    const std::string error = "TLS handshake failed: " + SslErrorString();
+    CloseConnection();
+    return Result<void>::Err(error);
+  }
+
+  if (!tls_config_.pinned_server_cert_sha256_hex.empty()) {
+    auto fingerprint = PeerCertificateSha256(tls_ssl_.get());
+    if (!fingerprint.ok()) {
+      CloseConnection();
+      return Result<void>::Err(fingerprint.error());
+    }
+    auto pin_check = VerifyPinnedSha256Fingerprint(
+        fingerprint.value(),
+        tls_config_.pinned_server_cert_sha256_hex);
+    if (!pin_check.ok()) {
+      CloseConnection();
+      return Result<void>::Err(pin_check.error());
+    }
+  }
+
+  return Result<void>::Ok();
+}
 
 Result<std::vector<uint8_t>> TcpServerApi::Request(server::TcpCommand command,
                                                    const std::vector<uint8_t>& payload) {
-  auto fd_result = ConnectTcp(host_, port_);
-  if (!fd_result.ok()) {
-    return Result<std::vector<uint8_t>>::Err(fd_result.error());
+  auto connected = EnsureConnected();
+  if (!connected.ok()) {
+    return Result<std::vector<uint8_t>>::Err(connected.error());
   }
-  int fd = fd_result.take_value();
-  FdGuard fd_guard(fd);
 
   Result<std::pair<uint32_t, std::vector<uint8_t>>> response =
       Result<std::pair<uint32_t, std::vector<uint8_t>>>::Err("request failed");
   if (tls_config_.enabled) {
-    auto ctx_result = CreateClientTlsContext(tls_config_);
-    if (!ctx_result.ok()) {
-      return Result<std::vector<uint8_t>>::Err(ctx_result.error());
-    }
-    auto ctx = ctx_result.take_value();
-
-    SSL* raw_ssl = SSL_new(ctx.get());
-    if (!raw_ssl) {
-      return Result<std::vector<uint8_t>>::Err("SSL_new failed: " + SslErrorString());
-    }
-    std::unique_ptr<SSL, decltype(&SSL_free)> ssl(raw_ssl, SSL_free);
-    SSL_set_fd(ssl.get(), fd);
-
-    const std::string verify_name =
-        tls_config_.server_name.empty() ? host_ : tls_config_.server_name;
-    if (!verify_name.empty()) {
-      X509_VERIFY_PARAM* verify_param = SSL_get0_param(ssl.get());
-      in_addr ipv4{};
-      in6_addr ipv6{};
-      const bool is_ip = inet_pton(AF_INET, verify_name.c_str(), &ipv4) == 1 ||
-                         inet_pton(AF_INET6, verify_name.c_str(), &ipv6) == 1;
-      if (is_ip) {
-        if (X509_VERIFY_PARAM_set1_ip_asc(verify_param, verify_name.c_str()) != 1) {
-          return Result<std::vector<uint8_t>>::Err(
-              "failed to set TLS verify IP");
-        }
-      } else {
-        if (SSL_set_tlsext_host_name(ssl.get(), verify_name.c_str()) != 1) {
-          return Result<std::vector<uint8_t>>::Err("failed to set TLS SNI hostname");
-        }
-        if (X509_VERIFY_PARAM_set1_host(verify_param, verify_name.c_str(), 0) != 1) {
-          return Result<std::vector<uint8_t>>::Err(
-              "failed to set TLS verify hostname");
-        }
-      }
-    }
-
-    if (SSL_connect(ssl.get()) != 1) {
-      return Result<std::vector<uint8_t>>::Err("TLS handshake failed: " + SslErrorString());
-    }
-
-    auto write = server::WriteFrameTls(ssl.get(), static_cast<uint32_t>(command), payload);
+    auto write = server::WriteFrameTls(tls_ssl_.get(), static_cast<uint32_t>(command), payload);
     if (!write.ok()) {
+      CloseConnection();
       return Result<std::vector<uint8_t>>::Err(write.error());
     }
-
-    response = server::ReadFrameTls(ssl.get());
-    SSL_shutdown(ssl.get());
+    response = server::ReadFrameTls(tls_ssl_.get());
   } else {
-    auto write = server::WriteFrame(fd, static_cast<uint32_t>(command), payload);
+    auto write = server::WriteFrame(fd_, static_cast<uint32_t>(command), payload);
     if (!write.ok()) {
+      CloseConnection();
       return Result<std::vector<uint8_t>>::Err(write.error());
     }
-    response = server::ReadFrame(fd);
+    response = server::ReadFrame(fd_);
   }
 
   if (!response.ok()) {
+    CloseConnection();
     return Result<std::vector<uint8_t>>::Err(response.error());
   }
 
@@ -274,6 +336,16 @@ Result<void> TcpServerApi::EnsureAuthenticated() {
   protocol::RegisterRequest register_request;
   register_request.user_id = user_id_;
   register_request.transport_auth_public_key = transport_auth_public_key_;
+  register_request.registration_token = registration_token_;
+  auto register_sign_input = protocol::BuildTransportRegisterSignInput(
+      user_id_,
+      transport_auth_public_key_);
+  auto register_signature = sign_fn_(register_sign_input);
+  if (!register_signature.ok()) {
+    return Result<void>::Err(register_signature.error());
+  }
+  register_request.proof_signature_mldsa65 = register_signature.take_value();
+  register_request.rotation_signature_mldsa65 = std::nullopt;
   auto register_status = RegisterTransportIdentity(register_request);
   if (!register_status.ok()) {
     return register_status;
@@ -374,6 +446,35 @@ Result<std::string> TcpServerApi::AuthenticateSessionToken(
   return Result<std::string>::Err("not supported on client adapter");
 }
 
+Result<void> TcpServerApi::RevokeSessionToken(
+    const std::vector<uint8_t>& session_token) {
+  protocol::AuthenticatedPayload authenticated;
+  authenticated.session_token = session_token;
+  authenticated.payload = {};
+  auto encoded = protocol::SerializeAuthenticatedPayload(authenticated);
+  if (!encoded.ok()) {
+    return Result<void>::Err(encoded.error());
+  }
+  auto response = Request(server::TcpCommand::kLogout, encoded.value());
+  if (!response.ok()) {
+    return Result<void>::Err(response.error());
+  }
+  if (session_token_ == session_token) {
+    session_token_.clear();
+    session_expires_at_unix_ = 0;
+  }
+  CloseConnection();
+  return Result<void>::Ok();
+}
+
+Result<void> TcpServerApi::LogoutCurrentSession() {
+  auto auth = EnsureAuthenticated();
+  if (!auth.ok()) {
+    return Result<void>::Err(auth.error());
+  }
+  return RevokeSessionToken(session_token_);
+}
+
 Result<void> TcpServerApi::PublishBundle(const protocol::PrekeyBundle& bundle) {
   auto auth = EnsureAuthenticated();
   if (!auth.ok()) {
@@ -435,25 +536,29 @@ Result<void> TcpServerApi::EnqueueEnvelope(const std::string& user_id,
   return Result<void>::Ok();
 }
 
-Result<std::vector<protocol::Envelope>> TcpServerApi::DrainInbox(
-    const std::string& user_id) {
+Result<std::vector<protocol::InboxEnvelope>> TcpServerApi::DrainInbox(
+    const std::string& user_id,
+    std::optional<uint64_t> ack_up_to_inbox_id) {
   auto auth = EnsureAuthenticated();
   if (!auth.ok()) {
-    return Result<std::vector<protocol::Envelope>>::Err(auth.error());
+    return Result<std::vector<protocol::InboxEnvelope>>::Err(auth.error());
   }
 
-  auto payload = protocol::SerializeString(user_id);
+  protocol::DrainInboxRequest request;
+  request.user_id = user_id;
+  request.ack_up_to_inbox_id = ack_up_to_inbox_id;
+  auto payload = protocol::SerializeDrainInboxRequest(request);
   if (!payload.ok()) {
-    return Result<std::vector<protocol::Envelope>>::Err(payload.error());
+    return Result<std::vector<protocol::InboxEnvelope>>::Err(payload.error());
   }
 
   auto response = RequestAuthenticated(server::TcpCommand::kDrainInbox,
                                        payload.value());
   if (!response.ok()) {
-    return Result<std::vector<protocol::Envelope>>::Err(response.error());
+    return Result<std::vector<protocol::InboxEnvelope>>::Err(response.error());
   }
 
-  return protocol::DeserializeEnvelopeVector(response.value());
+  return protocol::DeserializeInboxEnvelopeVector(response.value());
 }
 
 }  // namespace pqchat::client

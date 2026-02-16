@@ -32,6 +32,34 @@ Result<EvpPkeyPtr> PublicKeyFromRaw(const std::vector<uint8_t>& public_key) {
   return Result<EvpPkeyPtr>::Ok(EvpPkeyPtr(raw_pkey));
 }
 
+Result<EvpPkeyPtr> KeyPairFromRaw(const std::vector<uint8_t>& private_key,
+                                  const std::vector<uint8_t>& public_key) {
+  EvpPkeyCtxPtr fromdata_ctx(EVP_PKEY_CTX_new_from_name(nullptr, "ML-KEM-768", nullptr));
+  if (!fromdata_ctx) {
+    return Result<EvpPkeyPtr>::Err("ML-KEM-768 not available in OpenSSL provider");
+  }
+
+  if (EVP_PKEY_fromdata_init(fromdata_ctx.get()) != 1) {
+    return Result<EvpPkeyPtr>::Err("EVP_PKEY_fromdata_init failed");
+  }
+
+  OSSL_PARAM params[] = {
+      OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PRIV_KEY,
+                                        const_cast<uint8_t*>(private_key.data()),
+                                        private_key.size()),
+      OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY,
+                                        const_cast<uint8_t*>(public_key.data()),
+                                        public_key.size()),
+      OSSL_PARAM_construct_end()};
+
+  EVP_PKEY* raw_pkey = nullptr;
+  if (EVP_PKEY_fromdata(fromdata_ctx.get(), &raw_pkey, EVP_PKEY_KEYPAIR, params) != 1) {
+    return Result<EvpPkeyPtr>::Err("EVP_PKEY_fromdata failed for ML-KEM keypair");
+  }
+
+  return Result<EvpPkeyPtr>::Ok(EvpPkeyPtr(raw_pkey));
+}
+
 }  // namespace
 
 Result<MlKemKeyPair> MlKem768::GenerateKeyPair() {
@@ -67,6 +95,37 @@ Result<MlKemKeyPair> MlKem768::GenerateKeyPair() {
 
   MlKemKeyPair pair{std::move(private_key), std::move(public_key)};
   return Result<MlKemKeyPair>::Ok(std::move(pair));
+}
+
+Result<MlKemKeyPair> MlKem768::FromPrivateKey(
+    const std::vector<uint8_t>& private_key,
+    const std::vector<uint8_t>& public_key) {
+  auto key_result = KeyPairFromRaw(private_key, public_key);
+  if (!key_result.ok()) {
+    return Result<MlKemKeyPair>::Err(key_result.error());
+  }
+  MlKemKeyPair pair{key_result.take_value(), public_key};
+  return Result<MlKemKeyPair>::Ok(std::move(pair));
+}
+
+Result<std::vector<uint8_t>> MlKem768::ExportPrivateKey(EVP_PKEY* private_key) {
+  if (private_key == nullptr) {
+    return Result<std::vector<uint8_t>>::Err("private key is null");
+  }
+
+  size_t priv_len = 0;
+  if (EVP_PKEY_get_octet_string_param(private_key, OSSL_PKEY_PARAM_PRIV_KEY,
+                                      nullptr, 0, &priv_len) != 1) {
+    return Result<std::vector<uint8_t>>::Err("get private key size failed");
+  }
+
+  std::vector<uint8_t> out(priv_len);
+  if (EVP_PKEY_get_octet_string_param(private_key, OSSL_PKEY_PARAM_PRIV_KEY,
+                                      out.data(), out.size(), &priv_len) != 1) {
+    return Result<std::vector<uint8_t>>::Err("get private key failed");
+  }
+  out.resize(priv_len);
+  return Result<std::vector<uint8_t>>::Ok(std::move(out));
 }
 
 Result<MlKemEncapResult> MlKem768::Encapsulate(

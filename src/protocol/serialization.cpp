@@ -6,6 +6,20 @@
 namespace pqchat::protocol {
 namespace {
 
+constexpr size_t kMaxSerializedInputBytes = 8 * 1024 * 1024;
+constexpr uint32_t kMaxFieldBytes = 1024 * 1024;
+constexpr uint32_t kMaxStringBytes = 64 * 1024;
+constexpr uint32_t kMaxOneTimePrekeys = 4096;
+constexpr uint32_t kMaxEnvelopeVectorItems = 4096;
+
+Result<void> ValidateInputSize(const std::vector<uint8_t>& bytes,
+                               const char* label) {
+  if (bytes.size() > kMaxSerializedInputBytes) {
+    return Result<void>::Err(std::string(label) + " too large");
+  }
+  return Result<void>::Ok();
+}
+
 class Writer {
  public:
   void U8(uint8_t value) {
@@ -97,9 +111,17 @@ class Reader {
     return true;
   }
 
-  bool Bytes(std::vector<uint8_t>* out) {
+  bool Bytes(std::vector<uint8_t>* out,
+             uint32_t max_len = kMaxFieldBytes,
+             const char* label = "bytes") {
     uint32_t len = 0;
     if (!U32(&len)) {
+      return false;
+    }
+    if (len > max_len) {
+      error_ = "decoded ";
+      error_ += label;
+      error_ += " exceeds limit";
       return false;
     }
     if (pos_ + len > bytes_.size()) {
@@ -112,12 +134,22 @@ class Reader {
     return true;
   }
 
-  bool String(std::string* out) {
+  bool String(std::string* out, uint32_t max_len = kMaxStringBytes) {
     std::vector<uint8_t> bytes;
-    if (!Bytes(&bytes)) {
+    if (!Bytes(&bytes, max_len, "string")) {
       return false;
     }
     out->assign(bytes.begin(), bytes.end());
+    return true;
+  }
+
+  bool LimitU32(uint32_t value, uint32_t max, const char* label) {
+    if (value > max) {
+      error_ = "decoded ";
+      error_ += label;
+      error_ += " exceeds limit";
+      return false;
+    }
     return true;
   }
 
@@ -205,6 +237,8 @@ void WriteInitialMessage(Writer* writer, const InitialMessage& message) {
   writer->String(message.session_id);
   writer->String(message.from_user);
   writer->String(message.to_user);
+  writer->String(message.version);
+  writer->String(message.cipher_suite);
   writer->Bytes(message.initiator_identity_sign_public_key);
   writer->Bytes(message.initiator_identity_mldsa_public_key);
   writer->Bytes(message.initiator_identity_dh_public_key);
@@ -221,7 +255,8 @@ void WriteInitialMessage(Writer* writer, const InitialMessage& message) {
 
 bool ReadInitialMessage(Reader* reader, InitialMessage* message) {
   return reader->String(&message->session_id) && reader->String(&message->from_user) &&
-         reader->String(&message->to_user) &&
+         reader->String(&message->to_user) && reader->String(&message->version) &&
+         reader->String(&message->cipher_suite) &&
          reader->Bytes(&message->initiator_identity_sign_public_key) &&
          reader->Bytes(&message->initiator_identity_mldsa_public_key) &&
          reader->Bytes(&message->initiator_identity_dh_public_key) &&
@@ -278,65 +313,61 @@ bool ReadSignedPrekeyPq(Reader* reader, SignedPrekeyPq* spk) {
          reader->Bytes(&spk->signature_mldsa65);
 }
 
-void WriteOneTimeEc(Writer* writer, const std::optional<OneTimePrekeyEc>& one_time) {
-  writer->U8(one_time.has_value() ? 1 : 0);
-  if (!one_time.has_value()) {
-    return;
+void WriteOneTimeEc(Writer* writer, const std::vector<OneTimePrekeyEc>& one_time) {
+  writer->U32(static_cast<uint32_t>(one_time.size()));
+  for (const auto& key : one_time) {
+    writer->U32(key.id);
+    writer->Bytes(key.public_key);
   }
-  writer->U32(one_time->id);
-  writer->Bytes(one_time->public_key);
 }
 
-bool ReadOneTimeEc(Reader* reader, std::optional<OneTimePrekeyEc>* one_time) {
-  uint8_t present = 0;
-  if (!reader->U8(&present)) {
+bool ReadOneTimeEc(Reader* reader, std::vector<OneTimePrekeyEc>* one_time) {
+  uint32_t count = 0;
+  if (!reader->U32(&count)) {
     return false;
   }
-  if (present == 0) {
-    *one_time = std::nullopt;
-    return true;
-  }
-  if (present != 1) {
-    // Keep error context from parser caller.
+  if (!reader->LimitU32(count, kMaxOneTimePrekeys, "one-time EC prekey count")) {
     return false;
   }
 
-  OneTimePrekeyEc out;
-  if (!reader->U32(&out.id) || !reader->Bytes(&out.public_key)) {
-    return false;
+  one_time->clear();
+  one_time->reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    OneTimePrekeyEc out;
+    if (!reader->U32(&out.id) || !reader->Bytes(&out.public_key)) {
+      return false;
+    }
+    one_time->push_back(std::move(out));
   }
-  *one_time = std::move(out);
   return true;
 }
 
-void WriteOneTimePq(Writer* writer, const std::optional<OneTimePrekeyPq>& one_time) {
-  writer->U8(one_time.has_value() ? 1 : 0);
-  if (!one_time.has_value()) {
-    return;
+void WriteOneTimePq(Writer* writer, const std::vector<OneTimePrekeyPq>& one_time) {
+  writer->U32(static_cast<uint32_t>(one_time.size()));
+  for (const auto& key : one_time) {
+    writer->U32(key.id);
+    writer->Bytes(key.public_key);
   }
-  writer->U32(one_time->id);
-  writer->Bytes(one_time->public_key);
 }
 
-bool ReadOneTimePq(Reader* reader, std::optional<OneTimePrekeyPq>* one_time) {
-  uint8_t present = 0;
-  if (!reader->U8(&present)) {
+bool ReadOneTimePq(Reader* reader, std::vector<OneTimePrekeyPq>* one_time) {
+  uint32_t count = 0;
+  if (!reader->U32(&count)) {
     return false;
   }
-  if (present == 0) {
-    *one_time = std::nullopt;
-    return true;
-  }
-  if (present != 1) {
-    // Keep error context from parser caller.
+  if (!reader->LimitU32(count, kMaxOneTimePrekeys, "one-time PQ prekey count")) {
     return false;
   }
 
-  OneTimePrekeyPq out;
-  if (!reader->U32(&out.id) || !reader->Bytes(&out.public_key)) {
-    return false;
+  one_time->clear();
+  one_time->reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    OneTimePrekeyPq out;
+    if (!reader->U32(&out.id) || !reader->Bytes(&out.public_key)) {
+      return false;
+    }
+    one_time->push_back(std::move(out));
   }
-  *one_time = std::move(out);
   return true;
 }
 
@@ -352,12 +383,18 @@ Result<std::vector<uint8_t>> SerializePrekeyBundle(const PrekeyBundle& bundle) {
   WriteSignedPrekeyPq(&writer, bundle.signed_prekey_pq);
   WriteOneTimeEc(&writer, bundle.one_time_ec);
   WriteOneTimePq(&writer, bundle.one_time_pq);
+  writer.Bytes(bundle.bundle_signature_ed25519);
+  writer.Bytes(bundle.bundle_signature_mldsa65);
   writer.String(bundle.version);
   writer.String(bundle.cipher_suite);
   return Result<std::vector<uint8_t>>::Ok(writer.Take());
 }
 
 Result<PrekeyBundle> DeserializePrekeyBundle(const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "prekey bundle payload");
+  if (!size.ok()) {
+    return Result<PrekeyBundle>::Err(size.error());
+  }
   Reader reader(bytes);
   PrekeyBundle bundle;
 
@@ -367,7 +404,10 @@ Result<PrekeyBundle> DeserializePrekeyBundle(const std::vector<uint8_t>& bytes) 
       !ReadSignedPrekeyEc(&reader, &bundle.signed_prekey_ec) ||
       !ReadSignedPrekeyPq(&reader, &bundle.signed_prekey_pq) ||
       !ReadOneTimeEc(&reader, &bundle.one_time_ec) ||
-      !ReadOneTimePq(&reader, &bundle.one_time_pq) || !reader.String(&bundle.version) ||
+      !ReadOneTimePq(&reader, &bundle.one_time_pq) ||
+      !reader.Bytes(&bundle.bundle_signature_ed25519) ||
+      !reader.Bytes(&bundle.bundle_signature_mldsa65) ||
+      !reader.String(&bundle.version) ||
       !reader.String(&bundle.cipher_suite)) {
     return Result<PrekeyBundle>::Err("decode prekey bundle failed: " + reader.error());
   }
@@ -404,6 +444,10 @@ Result<std::vector<uint8_t>> SerializeEnvelope(const Envelope& envelope) {
 }
 
 Result<Envelope> DeserializeEnvelope(const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "envelope payload");
+  if (!size.ok()) {
+    return Result<Envelope>::Err(size.error());
+  }
   Reader reader(bytes);
   uint8_t tag = 0;
   if (!reader.U8(&tag)) {
@@ -450,11 +494,20 @@ Result<std::vector<uint8_t>> SerializeEnvelopeVector(
 
 Result<std::vector<Envelope>> DeserializeEnvelopeVector(
     const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "envelope vector payload");
+  if (!size.ok()) {
+    return Result<std::vector<Envelope>>::Err(size.error());
+  }
   Reader reader(bytes);
   uint32_t count = 0;
   if (!reader.U32(&count)) {
     return Result<std::vector<Envelope>>::Err("decode envelope vector failed: " +
                                               reader.error());
+  }
+
+  if (!reader.LimitU32(count, kMaxEnvelopeVectorItems, "envelope vector count")) {
+    return Result<std::vector<Envelope>>::Err(
+        "decode envelope vector failed: " + reader.error());
   }
 
   std::vector<Envelope> out;
@@ -480,6 +533,64 @@ Result<std::vector<Envelope>> DeserializeEnvelopeVector(
   return Result<std::vector<Envelope>>::Ok(std::move(out));
 }
 
+Result<std::vector<uint8_t>> SerializeInboxEnvelopeVector(
+    const std::vector<InboxEnvelope>& envelopes) {
+  Writer writer;
+  writer.U32(static_cast<uint32_t>(envelopes.size()));
+  for (const auto& item : envelopes) {
+    auto encoded = SerializeEnvelope(item.envelope);
+    if (!encoded.ok()) {
+      return Result<std::vector<uint8_t>>::Err(encoded.error());
+    }
+    writer.U64(item.inbox_id);
+    writer.Bytes(encoded.value());
+  }
+  return Result<std::vector<uint8_t>>::Ok(writer.Take());
+}
+
+Result<std::vector<InboxEnvelope>> DeserializeInboxEnvelopeVector(
+    const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "inbox envelope vector payload");
+  if (!size.ok()) {
+    return Result<std::vector<InboxEnvelope>>::Err(size.error());
+  }
+  Reader reader(bytes);
+  uint32_t count = 0;
+  if (!reader.U32(&count)) {
+    return Result<std::vector<InboxEnvelope>>::Err(
+        "decode inbox envelope vector failed: " + reader.error());
+  }
+
+  if (!reader.LimitU32(count, kMaxEnvelopeVectorItems, "inbox envelope vector count")) {
+    return Result<std::vector<InboxEnvelope>>::Err(
+        "decode inbox envelope vector failed: " + reader.error());
+  }
+
+  std::vector<InboxEnvelope> out;
+  out.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    InboxEnvelope item;
+    std::vector<uint8_t> encoded;
+    if (!reader.U64(&item.inbox_id) || !reader.Bytes(&encoded)) {
+      return Result<std::vector<InboxEnvelope>>::Err(
+          "decode inbox envelope vector item failed: " + reader.error());
+    }
+    auto envelope = DeserializeEnvelope(encoded);
+    if (!envelope.ok()) {
+      return Result<std::vector<InboxEnvelope>>::Err(envelope.error());
+    }
+    item.envelope = envelope.take_value();
+    out.push_back(std::move(item));
+  }
+
+  if (!reader.Finished()) {
+    return Result<std::vector<InboxEnvelope>>::Err(
+        "decode inbox envelope vector failed: trailing bytes");
+  }
+
+  return Result<std::vector<InboxEnvelope>>::Ok(std::move(out));
+}
+
 Result<std::vector<uint8_t>> SerializeString(const std::string& value) {
   Writer writer;
   writer.String(value);
@@ -487,6 +598,10 @@ Result<std::vector<uint8_t>> SerializeString(const std::string& value) {
 }
 
 Result<std::string> DeserializeString(const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "string payload");
+  if (!size.ok()) {
+    return Result<std::string>::Err(size.error());
+  }
   Reader reader(bytes);
   std::string out;
   if (!reader.String(&out)) {
@@ -513,6 +628,10 @@ Result<std::vector<uint8_t>> SerializeEnqueueRequest(
 
 Result<EnqueueRequest> DeserializeEnqueueRequest(
     const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "enqueue request payload");
+  if (!size.ok()) {
+    return Result<EnqueueRequest>::Err(size.error());
+  }
   Reader reader(bytes);
   EnqueueRequest out;
   std::vector<uint8_t> envelope_bytes;
@@ -535,19 +654,72 @@ Result<EnqueueRequest> DeserializeEnqueueRequest(
   return Result<EnqueueRequest>::Ok(std::move(out));
 }
 
+Result<std::vector<uint8_t>> SerializeDrainInboxRequest(
+    const DrainInboxRequest& request) {
+  Writer writer;
+  writer.String(request.user_id);
+  writer.U8(request.ack_up_to_inbox_id.has_value() ? 1 : 0);
+  if (request.ack_up_to_inbox_id.has_value()) {
+    writer.U64(*request.ack_up_to_inbox_id);
+  }
+  return Result<std::vector<uint8_t>>::Ok(writer.Take());
+}
+
+Result<DrainInboxRequest> DeserializeDrainInboxRequest(
+    const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "drain inbox request payload");
+  if (!size.ok()) {
+    return Result<DrainInboxRequest>::Err(size.error());
+  }
+  Reader reader(bytes);
+  DrainInboxRequest out;
+  uint8_t has_ack = 0;
+  if (!reader.String(&out.user_id) || !reader.U8(&has_ack)) {
+    return Result<DrainInboxRequest>::Err("decode drain inbox request failed: " +
+                                          reader.error());
+  }
+  if (has_ack == 1) {
+    uint64_t id = 0;
+    if (!reader.U64(&id)) {
+      return Result<DrainInboxRequest>::Err("decode drain inbox request failed: " +
+                                            reader.error());
+    }
+    out.ack_up_to_inbox_id = id;
+  } else if (has_ack != 0) {
+    return Result<DrainInboxRequest>::Err(
+        "decode drain inbox request failed: invalid ack tag");
+  }
+
+  if (!reader.Finished()) {
+    return Result<DrainInboxRequest>::Err(
+        "decode drain inbox request failed: trailing bytes");
+  }
+  return Result<DrainInboxRequest>::Ok(std::move(out));
+}
+
 Result<std::vector<uint8_t>> SerializeRegisterRequest(
     const RegisterRequest& request) {
   Writer writer;
   writer.String(request.user_id);
   writer.Bytes(request.transport_auth_public_key);
+  writer.String(request.registration_token);
+  writer.Bytes(request.proof_signature_mldsa65);
+  writer.OptionalBytes(request.rotation_signature_mldsa65);
   return Result<std::vector<uint8_t>>::Ok(writer.Take());
 }
 
 Result<RegisterRequest> DeserializeRegisterRequest(
     const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "register request payload");
+  if (!size.ok()) {
+    return Result<RegisterRequest>::Err(size.error());
+  }
   Reader reader(bytes);
   RegisterRequest out;
-  if (!reader.String(&out.user_id) || !reader.Bytes(&out.transport_auth_public_key)) {
+  if (!reader.String(&out.user_id) || !reader.Bytes(&out.transport_auth_public_key) ||
+      !reader.String(&out.registration_token) ||
+      !reader.Bytes(&out.proof_signature_mldsa65) ||
+      !reader.OptionalBytes(&out.rotation_signature_mldsa65)) {
     return Result<RegisterRequest>::Err("decode register request failed: " +
                                         reader.error());
   }
@@ -568,6 +740,10 @@ Result<std::vector<uint8_t>> SerializeAuthBeginRequest(
 
 Result<AuthBeginRequest> DeserializeAuthBeginRequest(
     const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "auth begin request payload");
+  if (!size.ok()) {
+    return Result<AuthBeginRequest>::Err(size.error());
+  }
   Reader reader(bytes);
   AuthBeginRequest out;
   if (!reader.String(&out.user_id) || !reader.Bytes(&out.client_nonce)) {
@@ -592,6 +768,10 @@ Result<std::vector<uint8_t>> SerializeAuthBeginResponse(
 
 Result<AuthBeginResponse> DeserializeAuthBeginResponse(
     const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "auth begin response payload");
+  if (!size.ok()) {
+    return Result<AuthBeginResponse>::Err(size.error());
+  }
   Reader reader(bytes);
   AuthBeginResponse out;
   if (!reader.String(&out.challenge_id) || !reader.Bytes(&out.server_nonce) ||
@@ -620,6 +800,10 @@ Result<std::vector<uint8_t>> SerializeAuthFinishRequest(
 
 Result<AuthFinishRequest> DeserializeAuthFinishRequest(
     const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "auth finish request payload");
+  if (!size.ok()) {
+    return Result<AuthFinishRequest>::Err(size.error());
+  }
   Reader reader(bytes);
   AuthFinishRequest out;
   if (!reader.String(&out.user_id) || !reader.String(&out.challenge_id) ||
@@ -645,6 +829,10 @@ Result<std::vector<uint8_t>> SerializeAuthFinishResponse(
 
 Result<AuthFinishResponse> DeserializeAuthFinishResponse(
     const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "auth finish response payload");
+  if (!size.ok()) {
+    return Result<AuthFinishResponse>::Err(size.error());
+  }
   Reader reader(bytes);
   AuthFinishResponse out;
   if (!reader.Bytes(&out.session_token) || !reader.U64(&out.expires_at_unix)) {
@@ -668,6 +856,10 @@ Result<std::vector<uint8_t>> SerializeAuthenticatedPayload(
 
 Result<AuthenticatedPayload> DeserializeAuthenticatedPayload(
     const std::vector<uint8_t>& bytes) {
+  auto size = ValidateInputSize(bytes, "authenticated payload");
+  if (!size.ok()) {
+    return Result<AuthenticatedPayload>::Err(size.error());
+  }
   Reader reader(bytes);
   AuthenticatedPayload out;
   if (!reader.Bytes(&out.session_token) || !reader.Bytes(&out.payload)) {

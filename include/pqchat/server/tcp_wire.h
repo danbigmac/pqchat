@@ -18,12 +18,15 @@ enum class TcpCommand : uint32_t {
   kRegisterTransportIdentity = 5,
   kAuthBegin = 6,
   kAuthFinish = 7,
+  kLogout = 8,
 };
 
 enum class TcpStatus : uint32_t {
   kOk = 0,
   kError = 1,
 };
+
+inline constexpr uint32_t kMaxFramePayloadBytes = 1024 * 1024;  // 1 MiB
 
 // Frame format: [u32 type][u32 payload_len][payload bytes]
 Result<void> WriteFrame(int fd, uint32_t type, const std::vector<uint8_t>& payload);

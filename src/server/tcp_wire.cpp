@@ -131,6 +131,10 @@ Result<void> WriteExactTls(SSL* ssl, const uint8_t* data, size_t len) {
 }  // namespace
 
 Result<void> WriteFrame(int fd, uint32_t type, const std::vector<uint8_t>& payload) {
+  if (payload.size() > kMaxFramePayloadBytes) {
+    return Result<void>::Err("frame payload too large");
+  }
+
   uint8_t header[8];
   StoreU32(header, type);
   StoreU32(header + 4, static_cast<uint32_t>(payload.size()));
@@ -153,6 +157,10 @@ Result<void> WriteFrame(int fd, uint32_t type, const std::vector<uint8_t>& paylo
 Result<void> WriteFrameTls(SSL* ssl,
                            uint32_t type,
                            const std::vector<uint8_t>& payload) {
+  if (payload.size() > kMaxFramePayloadBytes) {
+    return Result<void>::Err("frame payload too large");
+  }
+
   uint8_t header[8];
   StoreU32(header, type);
   StoreU32(header + 4, static_cast<uint32_t>(payload.size()));
@@ -182,6 +190,10 @@ Result<std::pair<uint32_t, std::vector<uint8_t>>> ReadFrame(int fd) {
 
   uint32_t type = LoadU32(header);
   uint32_t payload_len = LoadU32(header + 4);
+  if (payload_len > kMaxFramePayloadBytes) {
+    return Result<std::pair<uint32_t, std::vector<uint8_t>>>::Err(
+        "frame payload too large");
+  }
 
   std::vector<uint8_t> payload(payload_len);
   if (payload_len > 0) {
@@ -206,6 +218,10 @@ Result<std::pair<uint32_t, std::vector<uint8_t>>> ReadFrameTls(SSL* ssl) {
 
   uint32_t type = LoadU32(header);
   uint32_t payload_len = LoadU32(header + 4);
+  if (payload_len > kMaxFramePayloadBytes) {
+    return Result<std::pair<uint32_t, std::vector<uint8_t>>>::Err(
+        "frame payload too large");
+  }
 
   std::vector<uint8_t> payload(payload_len);
   if (payload_len > 0) {

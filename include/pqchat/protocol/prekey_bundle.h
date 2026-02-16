@@ -48,8 +48,10 @@ struct PrekeyBundle {
   std::vector<uint8_t> identity_dh_public_key;
   SignedPrekeyEc signed_prekey_ec;
   SignedPrekeyPq signed_prekey_pq;
-  std::optional<OneTimePrekeyEc> one_time_ec;
-  std::optional<OneTimePrekeyPq> one_time_pq;
+  std::vector<OneTimePrekeyEc> one_time_ec;
+  std::vector<OneTimePrekeyPq> one_time_pq;
+  std::vector<uint8_t> bundle_signature_ed25519;
+  std::vector<uint8_t> bundle_signature_mldsa65;
   std::string version = kProtocolVersion;
   std::string cipher_suite = kCipherSuite;
 };
@@ -73,6 +75,8 @@ std::vector<uint8_t> BuildEcPrekeySignInput(uint32_t key_id,
 
 std::vector<uint8_t> BuildPqPrekeySignInput(uint32_t key_id,
                                             const std::vector<uint8_t>& public_key);
+
+std::vector<uint8_t> BuildBundleSignInput(const PrekeyBundle& bundle);
 
 Result<void> VerifyPrekeyBundleSignatures(const PrekeyBundle& bundle);
 

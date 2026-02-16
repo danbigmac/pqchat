@@ -11,6 +11,7 @@ Frame format:
 
 ## Authentication Model
 - Transport auth key: `ML-DSA-65` public key registered per `user_id`
+- Optional provisioning gate: first-time `RegisterTransportIdentity` may require a user-bound provisioning token (HMAC-SHA256 over `user_id` using server provisioning secret)
 - Login: challenge/response signed with ML-DSA-65
 - Session: short-lived opaque bearer token (stored server-side as HMAC hash)
 
@@ -29,9 +30,15 @@ Server binds actions to authenticated user identity.
 - `6` = `AuthBegin` (unauthenticated)
 - `7` = `AuthFinish` (unauthenticated)
 
+`DrainInbox` payload:
+- request: `{user_id, ack_up_to_inbox_id?}`
+- response: `[{inbox_id, envelope}]` ordered by `inbox_id`
+- semantics: server deletes entries `<= ack_up_to_inbox_id` for `user_id`, then returns the next bounded page of remaining entries.
+- clients should loop `DrainInbox` until an empty page is returned.
+
 ## Login Flow
 1. `RegisterTransportIdentity`
-   - payload: `{user_id, transport_auth_public_key}`
+   - payload: `{user_id, transport_auth_public_key, registration_token}`
 2. `AuthBegin`
    - payload: `{user_id, client_nonce}`
    - response: `{challenge_id, server_nonce, expires_at_unix}`
@@ -61,7 +68,8 @@ SQLite schema is initialized automatically on startup:
 - `one_time_pq`
 - `inbox`
 
-One-time prekeys are consumed atomically in `AcquireBundle` transactions.
+`AcquireBundle` returns the publisher-signed one-time prekey lists currently stored for the user.
+One-time prekey consumption happens on the receiving client when an initial message references a specific prekey ID.
 
 ## Security Enforcement
 - `PublishBundle`: `bundle.user_id` must match authenticated session user.
@@ -71,6 +79,7 @@ One-time prekeys are consumed atomically in `AcquireBundle` transactions.
 
 ## Notes
 - Payloads use canonical binary serialization (`src/protocol/serialization.cpp`).
+- Server and CLI defaults are secure-by-default: TLS is required unless `--allow-insecure-dev` is set.
 - TLS options:
   - server: `--tls-cert`, `--tls-key`, optional `--tls-client-ca`, `--tls-require-client-cert`
   - client: `--tls-ca`, optional `--tls-server-name`, `--tls-client-cert`, `--tls-client-key`

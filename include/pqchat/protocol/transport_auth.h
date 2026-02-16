@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,9 @@ namespace pqchat::protocol {
 struct RegisterRequest {
   std::string user_id;
   std::vector<uint8_t> transport_auth_public_key;
+  std::string registration_token;
+  std::vector<uint8_t> proof_signature_mldsa65;
+  std::optional<std::vector<uint8_t>> rotation_signature_mldsa65;
 };
 
 struct AuthBeginRequest {
@@ -47,5 +51,14 @@ std::vector<uint8_t> BuildTransportAuthSignInput(
     const std::vector<uint8_t>& server_nonce,
     const std::string& challenge_id,
     uint64_t expires_at_unix);
+
+std::vector<uint8_t> BuildTransportRegisterSignInput(
+    const std::string& user_id,
+    const std::vector<uint8_t>& new_transport_auth_public_key);
+
+std::vector<uint8_t> BuildTransportRegisterRotateSignInput(
+    const std::string& user_id,
+    const std::vector<uint8_t>& existing_transport_auth_public_key,
+    const std::vector<uint8_t>& new_transport_auth_public_key);
 
 }  // namespace pqchat::protocol

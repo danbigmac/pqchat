@@ -18,6 +18,11 @@ struct MlDsa65KeyPair {
 class MlDsa65 {
  public:
   static Result<MlDsa65KeyPair> GenerateKeyPair();
+  static Result<MlDsa65KeyPair> FromPrivateKey(
+      const std::vector<uint8_t>& private_key,
+      const std::vector<uint8_t>& public_key);
+
+  static Result<std::vector<uint8_t>> ExportPrivateKey(EVP_PKEY* private_key);
 
   static Result<std::vector<uint8_t>> Sign(EVP_PKEY* private_key,
                                            const std::vector<uint8_t>& message);

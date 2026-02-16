@@ -1,6 +1,8 @@
 #include "pqchat/server/sqlite_store.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <iomanip>
 #include <memory>
@@ -8,6 +10,7 @@
 #include <sstream>
 #include <string>
 
+#include <openssl/crypto.h>
 #include <openssl/rand.h>
 
 #include "pqchat/crypto/hkdf.h"
@@ -20,6 +23,112 @@ namespace {
 
 using StmtPtr = std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)>;
 
+constexpr size_t kMaxUserIdBytes = 64;
+constexpr size_t kMaxTransportAuthPublicKeyBytes = 8192;
+constexpr size_t kExpectedAuthNonceBytes = 32;
+constexpr size_t kExpectedSessionTokenBytes = 32;
+constexpr size_t kMinMlDsaSignatureBytes = 64;
+constexpr size_t kMaxMlDsaSignatureBytes = 8192;
+constexpr size_t kChallengeIdHexBytes = 32;
+constexpr size_t kMaxDrainInboxBatchItems = 128;
+constexpr size_t kMaxDrainInboxBatchBytes = 512 * 1024;
+constexpr uint64_t kAuthRateWindowSeconds = 60;
+constexpr size_t kMaxAuthBeginAttemptsPerWindow = 30;
+constexpr size_t kMaxAuthFinishAttemptsPerWindow = 30;
+
+bool IsValidUserId(const std::string& user_id) {
+  if (user_id.empty() || user_id.size() > kMaxUserIdBytes) {
+    return false;
+  }
+
+  for (unsigned char c : user_id) {
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+        c == '.') {
+      continue;
+    }
+    return false;
+  }
+
+  return true;
+}
+
+int HexValue(char c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'a' && c <= 'f') {
+    return 10 + (c - 'a');
+  }
+  if (c >= 'A' && c <= 'F') {
+    return 10 + (c - 'A');
+  }
+  return -1;
+}
+
+bool IsValidHexString(const std::string& value) {
+  for (char c : value) {
+    if (HexValue(c) < 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsValidChallengeId(const std::string& challenge_id) {
+  return challenge_id.size() == kChallengeIdHexBytes &&
+         IsValidHexString(challenge_id);
+}
+
+Result<std::vector<uint8_t>> DecodeHex(const std::string& hex) {
+  if ((hex.size() % 2) != 0) {
+    return Result<std::vector<uint8_t>>::Err("invalid hex length");
+  }
+
+  std::vector<uint8_t> out;
+  out.reserve(hex.size() / 2);
+  for (size_t i = 0; i < hex.size(); i += 2) {
+    int hi = HexValue(hex[i]);
+    int lo = HexValue(hex[i + 1]);
+    if (hi < 0 || lo < 0) {
+      return Result<std::vector<uint8_t>>::Err("invalid hex character");
+    }
+    out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+  }
+  return Result<std::vector<uint8_t>>::Ok(std::move(out));
+}
+
+Result<void> VerifyProvisioningToken(const std::string& provisioning_secret,
+                                     const std::string& user_id,
+                                     const std::string& token_hex) {
+  auto expected = crypto::HmacSha256(crypto::ToBytes(provisioning_secret),
+                                     crypto::ToBytes(user_id));
+  if (!expected.ok()) {
+    return Result<void>::Err("failed to derive registration token");
+  }
+
+  const auto& expected_bytes = expected.value();
+  if (token_hex.size() != expected_bytes.size() * 2) {
+    return Result<void>::Err("invalid registration token");
+  }
+
+  auto provided = DecodeHex(token_hex);
+  if (!provided.ok()) {
+    return Result<void>::Err("invalid registration token");
+  }
+
+  const auto& provided_bytes = provided.value();
+  if (expected_bytes.size() != provided_bytes.size()) {
+    return Result<void>::Err("invalid registration token");
+  }
+  if (CRYPTO_memcmp(expected_bytes.data(),
+                    provided_bytes.data(),
+                    expected_bytes.size()) != 0) {
+    return Result<void>::Err("invalid registration token");
+  }
+
+  return Result<void>::Ok();
+}
+
 Result<void> Exec(sqlite3* db, const char* sql) {
   char* errmsg = nullptr;
   if (sqlite3_exec(db, sql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
@@ -28,6 +137,17 @@ Result<void> Exec(sqlite3* db, const char* sql) {
     return Result<void>::Err(message);
   }
   return Result<void>::Ok();
+}
+
+Result<void> ExecAllowingDuplicateColumn(sqlite3* db, const char* sql) {
+  auto exec = Exec(db, sql);
+  if (exec.ok()) {
+    return exec;
+  }
+  if (exec.error().find("duplicate column name") != std::string::npos) {
+    return Result<void>::Ok();
+  }
+  return exec;
 }
 
 Result<StmtPtr> Prepare(sqlite3* db, const char* sql) {
@@ -138,7 +258,9 @@ Result<void> InsertOneTimePq(sqlite3* db,
 
 }  // namespace
 
-SqliteStore::SqliteStore(sqlite3* db) : db_(db) {}
+SqliteStore::SqliteStore(sqlite3* db, std::string required_registration_token)
+    : db_(db),
+      required_registration_token_(std::move(required_registration_token)) {}
 
 SqliteStore::~SqliteStore() {
   if (db_ != nullptr) {
@@ -147,7 +269,9 @@ SqliteStore::~SqliteStore() {
   }
 }
 
-Result<std::unique_ptr<SqliteStore>> SqliteStore::Open(const std::string& db_path) {
+Result<std::unique_ptr<SqliteStore>> SqliteStore::Open(
+    const std::string& db_path,
+    std::string required_registration_token) {
   sqlite3* db = nullptr;
   if (sqlite3_open(db_path.c_str(), &db) != SQLITE_OK) {
     std::string error = db ? sqlite3_errmsg(db) : "sqlite3_open failed";
@@ -157,7 +281,8 @@ Result<std::unique_ptr<SqliteStore>> SqliteStore::Open(const std::string& db_pat
     return Result<std::unique_ptr<SqliteStore>>::Err(error);
   }
 
-  auto store = std::unique_ptr<SqliteStore>(new SqliteStore(db));
+  auto store = std::unique_ptr<SqliteStore>(
+      new SqliteStore(db, std::move(required_registration_token)));
   auto secret = RandomBytes(32);
   if (!secret.ok()) {
     return Result<std::unique_ptr<SqliteStore>>::Err(secret.error());
@@ -200,6 +325,55 @@ std::string SqliteStore::RandomHex(size_t bytes) {
   return oss.str();
 }
 
+Result<void> SqliteStore::CleanupAuthState(uint64_t now) {
+  auto prune_challenges = Prepare(
+      db_,
+      "DELETE FROM auth_challenges WHERE used != 0 OR expires_at_unix < ?;");
+  if (!prune_challenges.ok()) {
+    return Result<void>::Err(prune_challenges.error());
+  }
+  auto prune_challenges_stmt = prune_challenges.take_value();
+  if (sqlite3_bind_int64(prune_challenges_stmt.get(), 1,
+                         static_cast<sqlite3_int64>(now)) != SQLITE_OK) {
+    return Result<void>::Err("bind auth challenge cleanup failed");
+  }
+  auto prune_challenges_step = StepDone(db_, prune_challenges_stmt.get());
+  if (!prune_challenges_step.ok()) {
+    return prune_challenges_step;
+  }
+
+  auto prune_sessions = Prepare(
+      db_,
+      "DELETE FROM sessions WHERE expires_at_unix < ?;");
+  if (!prune_sessions.ok()) {
+    return Result<void>::Err(prune_sessions.error());
+  }
+  auto prune_sessions_stmt = prune_sessions.take_value();
+  if (sqlite3_bind_int64(prune_sessions_stmt.get(), 1,
+                         static_cast<sqlite3_int64>(now)) != SQLITE_OK) {
+    return Result<void>::Err("bind session cleanup failed");
+  }
+  return StepDone(db_, prune_sessions_stmt.get());
+}
+
+Result<void> SqliteStore::EnforceRateLimit(
+    std::unordered_map<std::string, std::deque<uint64_t>>* buckets,
+    const std::string& user_id,
+    uint64_t now,
+    size_t max_attempts,
+    uint64_t window_seconds,
+    const char* error_text) {
+  auto& bucket = (*buckets)[user_id];
+  while (!bucket.empty() && bucket.front() + window_seconds <= now) {
+    bucket.pop_front();
+  }
+  if (bucket.size() >= max_attempts) {
+    return Result<void>::Err(error_text);
+  }
+  bucket.push_back(now);
+  return Result<void>::Ok();
+}
+
 Result<std::vector<uint8_t>> SqliteStore::HashToken(
     const std::vector<uint8_t>& token) const {
   auto hash = crypto::HmacSha256(token_hmac_secret_, token);
@@ -207,6 +381,36 @@ Result<std::vector<uint8_t>> SqliteStore::HashToken(
     return Result<std::vector<uint8_t>>::Err(hash.error());
   }
   return Result<std::vector<uint8_t>>::Ok(hash.take_value());
+}
+
+Result<void> SqliteStore::AppendAuthAudit(const std::string& user_id,
+                                          const std::string& event,
+                                          const std::string& detail) {
+  auto stmt_result = Prepare(
+      db_,
+      "INSERT INTO auth_audit_log(event_time_unix, user_id, event, detail) VALUES(?, ?, ?, ?);");
+  if (!stmt_result.ok()) {
+    return Result<void>::Err(stmt_result.error());
+  }
+  auto stmt = stmt_result.take_value();
+
+  const uint64_t now = NowUnix();
+  if (sqlite3_bind_int64(stmt.get(), 1, static_cast<sqlite3_int64>(now)) != SQLITE_OK) {
+    return Result<void>::Err("bind auth audit timestamp failed");
+  }
+  auto bind_user = BindText(stmt.get(), 2, user_id);
+  if (!bind_user.ok()) {
+    return bind_user;
+  }
+  auto bind_event = BindText(stmt.get(), 3, event);
+  if (!bind_event.ok()) {
+    return bind_event;
+  }
+  auto bind_detail = BindText(stmt.get(), 4, detail);
+  if (!bind_detail.ok()) {
+    return bind_detail;
+  }
+  return StepDone(db_, stmt.get());
 }
 
 Result<void> SqliteStore::InitSchema() {
@@ -233,6 +437,14 @@ CREATE TABLE IF NOT EXISTS sessions (
   revoked INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS auth_audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_time_unix INTEGER NOT NULL,
+  user_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  detail TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS bundles (
   user_id TEXT PRIMARY KEY,
   identity_sign_public_key BLOB NOT NULL,
@@ -246,6 +458,8 @@ CREATE TABLE IF NOT EXISTS bundles (
   spk_pq_public_key BLOB NOT NULL,
   spk_pq_sig_ed25519 BLOB NOT NULL,
   spk_pq_sig_mldsa65 BLOB NOT NULL,
+  bundle_sig_ed25519 BLOB NOT NULL,
+  bundle_sig_mldsa65 BLOB NOT NULL,
   version TEXT NOT NULL,
   cipher_suite TEXT NOT NULL
 );
@@ -274,14 +488,68 @@ CREATE INDEX IF NOT EXISTS idx_one_time_ec_user ON one_time_ec(user_id, rowid);
 CREATE INDEX IF NOT EXISTS idx_one_time_pq_user ON one_time_pq(user_id, rowid);
 CREATE INDEX IF NOT EXISTS idx_inbox_user ON inbox(user_id, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at_unix);
+CREATE INDEX IF NOT EXISTS idx_auth_challenges_expiry ON auth_challenges(expires_at_unix, used);
+CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at_unix, revoked);
+CREATE INDEX IF NOT EXISTS idx_auth_audit_event_time ON auth_audit_log(event_time_unix, id);
+CREATE INDEX IF NOT EXISTS idx_auth_audit_user ON auth_audit_log(user_id, event_time_unix);
 )SQL";
 
-  return Exec(db_, kSchema);
+  auto init = Exec(db_, kSchema);
+  if (!init.ok()) {
+    return init;
+  }
+
+  auto add_bundle_sig_ed = ExecAllowingDuplicateColumn(
+      db_,
+      "ALTER TABLE bundles ADD COLUMN bundle_sig_ed25519 BLOB NOT NULL DEFAULT X'';");
+  if (!add_bundle_sig_ed.ok()) {
+    return add_bundle_sig_ed;
+  }
+  auto add_bundle_sig_ml = ExecAllowingDuplicateColumn(
+      db_,
+      "ALTER TABLE bundles ADD COLUMN bundle_sig_mldsa65 BLOB NOT NULL DEFAULT X'';");
+  if (!add_bundle_sig_ml.ok()) {
+    return add_bundle_sig_ml;
+  }
+
+  return Result<void>::Ok();
 }
 
 Result<void> SqliteStore::RegisterTransportIdentity(
     const protocol::RegisterRequest& request) {
   std::scoped_lock lock(mu_);
+
+  if (!IsValidUserId(request.user_id)) {
+    AppendAuthAudit(request.user_id, "register_rejected", "invalid_user_id");
+    return Result<void>::Err(
+        "invalid user_id (allowed: lowercase a-z, 0-9, '-', '_', '.', max 64)");
+  }
+  if (request.transport_auth_public_key.empty() ||
+      request.transport_auth_public_key.size() > kMaxTransportAuthPublicKeyBytes) {
+    AppendAuthAudit(request.user_id, "register_rejected", "invalid_public_key_size");
+    return Result<void>::Err("invalid transport auth public key size");
+  }
+  if (request.proof_signature_mldsa65.size() < kMinMlDsaSignatureBytes ||
+      request.proof_signature_mldsa65.size() > kMaxMlDsaSignatureBytes) {
+    AppendAuthAudit(request.user_id, "register_rejected", "invalid_registration_proof_size");
+    return Result<void>::Err("invalid registration proof signature size");
+  }
+  if (request.rotation_signature_mldsa65.has_value() &&
+      (request.rotation_signature_mldsa65->size() < kMinMlDsaSignatureBytes ||
+       request.rotation_signature_mldsa65->size() > kMaxMlDsaSignatureBytes)) {
+    AppendAuthAudit(request.user_id, "register_rejected", "invalid_rotation_signature_size");
+    return Result<void>::Err("invalid rotation signature size");
+  }
+
+  auto register_sign_input = protocol::BuildTransportRegisterSignInput(
+      request.user_id, request.transport_auth_public_key);
+  auto register_sig_ok = crypto::MlDsa65::Verify(request.transport_auth_public_key,
+                                                 register_sign_input,
+                                                 request.proof_signature_mldsa65);
+  if (!register_sig_ok.ok()) {
+    AppendAuthAudit(request.user_id, "register_rejected", "registration_proof_invalid");
+    return Result<void>::Err("transport identity registration proof invalid");
+  }
 
   auto select_result = Prepare(
       db_, "SELECT transport_auth_public_key FROM accounts WHERE user_id = ?;");
@@ -298,13 +566,104 @@ Result<void> SqliteStore::RegisterTransportIdentity(
   if (rc == SQLITE_ROW) {
     auto existing = ColumnBlob(select_stmt.get(), 0);
     if (existing != request.transport_auth_public_key) {
-      return Result<void>::Err(
-          "transport identity already registered with different key");
+      bool rotated = false;
+      if (request.rotation_signature_mldsa65.has_value()) {
+        auto rotate_sign_input = protocol::BuildTransportRegisterRotateSignInput(
+            request.user_id,
+            existing,
+            request.transport_auth_public_key);
+        auto rotate_sig_ok = crypto::MlDsa65::Verify(existing,
+                                                     rotate_sign_input,
+                                                     *request.rotation_signature_mldsa65);
+        rotated = rotate_sig_ok.ok();
+      }
+
+      bool recovered = false;
+      if (!rotated && !required_registration_token_.empty()) {
+        auto token_verify = VerifyProvisioningToken(required_registration_token_,
+                                                    request.user_id,
+                                                    request.registration_token);
+        recovered = token_verify.ok();
+      }
+
+      if (!rotated && !recovered) {
+        AppendAuthAudit(request.user_id, "register_rejected", "rotation_or_recovery_required");
+        return Result<void>::Err(
+            "transport identity already registered with different key (rotation/recovery required)");
+      }
+
+      auto begin = Begin(db_);
+      if (!begin.ok()) {
+        return Result<void>::Err(begin.error());
+      }
+
+      auto update_result = Prepare(
+          db_,
+          "UPDATE accounts SET transport_auth_public_key = ? WHERE user_id = ?;");
+      if (!update_result.ok()) {
+        Rollback(db_);
+        return Result<void>::Err(update_result.error());
+      }
+      auto update_stmt = update_result.take_value();
+      auto bind_new_key = BindBlob(update_stmt.get(), 1, request.transport_auth_public_key);
+      if (!bind_new_key.ok()) {
+        Rollback(db_);
+        return bind_new_key;
+      }
+      auto bind_update_user = BindText(update_stmt.get(), 2, request.user_id);
+      if (!bind_update_user.ok()) {
+        Rollback(db_);
+        return bind_update_user;
+      }
+      auto update_step = StepDone(db_, update_stmt.get());
+      if (!update_step.ok()) {
+        Rollback(db_);
+        return update_step;
+      }
+
+      auto revoke_result =
+          Prepare(db_, "UPDATE sessions SET revoked = 1 WHERE user_id = ? AND revoked = 0;");
+      if (!revoke_result.ok()) {
+        Rollback(db_);
+        return Result<void>::Err(revoke_result.error());
+      }
+      auto revoke_stmt = revoke_result.take_value();
+      auto bind_revoke_user = BindText(revoke_stmt.get(), 1, request.user_id);
+      if (!bind_revoke_user.ok()) {
+        Rollback(db_);
+        return bind_revoke_user;
+      }
+      auto revoke_step = StepDone(db_, revoke_stmt.get());
+      if (!revoke_step.ok()) {
+        Rollback(db_);
+        return revoke_step;
+      }
+
+      auto commit = Commit(db_);
+      if (!commit.ok()) {
+        Rollback(db_);
+        return commit;
+      }
+      AppendAuthAudit(request.user_id,
+                      "register_rotated",
+                      rotated ? "rotation_signature" : "recovery_token");
+      return Result<void>::Ok();
     }
+    AppendAuthAudit(request.user_id, "register_ok", "already_registered");
     return Result<void>::Ok();
   }
   if (rc != SQLITE_DONE) {
     return Result<void>::Err(sqlite3_errmsg(db_));
+  }
+
+  if (!required_registration_token_.empty()) {
+    auto token_verify = VerifyProvisioningToken(required_registration_token_,
+                                                request.user_id,
+                                                request.registration_token);
+    if (!token_verify.ok()) {
+      AppendAuthAudit(request.user_id, "register_rejected", "invalid_registration_token");
+      return token_verify;
+    }
   }
 
   auto insert_result = Prepare(
@@ -325,12 +684,41 @@ Result<void> SqliteStore::RegisterTransportIdentity(
     return bind_insert_key;
   }
 
-  return StepDone(db_, insert_stmt.get());
+  auto step = StepDone(db_, insert_stmt.get());
+  if (!step.ok()) {
+    return step;
+  }
+  AppendAuthAudit(request.user_id, "register_ok", "new_account");
+  return Result<void>::Ok();
 }
 
 Result<protocol::AuthBeginResponse> SqliteStore::BeginTransportAuthentication(
     const protocol::AuthBeginRequest& request) {
   std::scoped_lock lock(mu_);
+  const uint64_t now = NowUnix();
+
+  auto cleanup = CleanupAuthState(now);
+  if (!cleanup.ok()) {
+    return Result<protocol::AuthBeginResponse>::Err(cleanup.error());
+  }
+  if (!IsValidUserId(request.user_id)) {
+    AppendAuthAudit(request.user_id, "auth_begin_rejected", "invalid_user_id");
+    return Result<protocol::AuthBeginResponse>::Err("invalid user_id");
+  }
+  if (request.client_nonce.size() != kExpectedAuthNonceBytes) {
+    AppendAuthAudit(request.user_id, "auth_begin_rejected", "invalid_client_nonce_size");
+    return Result<protocol::AuthBeginResponse>::Err("invalid client nonce size");
+  }
+  auto rate_limit = EnforceRateLimit(&auth_begin_attempts_,
+                                     request.user_id,
+                                     now,
+                                     kMaxAuthBeginAttemptsPerWindow,
+                                     kAuthRateWindowSeconds,
+                                     "auth begin rate limit exceeded");
+  if (!rate_limit.ok()) {
+    AppendAuthAudit(request.user_id, "auth_begin_rejected", "rate_limit");
+    return Result<protocol::AuthBeginResponse>::Err(rate_limit.error());
+  }
 
   auto account_result =
       Prepare(db_, "SELECT 1 FROM accounts WHERE user_id = ? LIMIT 1;");
@@ -343,7 +731,8 @@ Result<protocol::AuthBeginResponse> SqliteStore::BeginTransportAuthentication(
     return Result<protocol::AuthBeginResponse>::Err(bind_user.error());
   }
   if (sqlite3_step(account_stmt.get()) != SQLITE_ROW) {
-    return Result<protocol::AuthBeginResponse>::Err("unknown user");
+    AppendAuthAudit(request.user_id, "auth_begin_rejected", "unknown_user");
+    return Result<protocol::AuthBeginResponse>::Err("authentication failed");
   }
 
   protocol::AuthBeginResponse response;
@@ -353,7 +742,7 @@ Result<protocol::AuthBeginResponse> SqliteStore::BeginTransportAuthentication(
     return Result<protocol::AuthBeginResponse>::Err("RNG failed");
   }
   response.server_nonce = nonce.take_value();
-  response.expires_at_unix = NowUnix() + 60;
+  response.expires_at_unix = now + 60;
 
   auto insert_result = Prepare(
       db_,
@@ -392,12 +781,48 @@ Result<protocol::AuthBeginResponse> SqliteStore::BeginTransportAuthentication(
     return Result<protocol::AuthBeginResponse>::Err(step.error());
   }
 
+  AppendAuthAudit(request.user_id, "auth_begin_ok", "challenge_issued");
+
   return Result<protocol::AuthBeginResponse>::Ok(std::move(response));
 }
 
 Result<protocol::AuthFinishResponse> SqliteStore::FinishTransportAuthentication(
     const protocol::AuthFinishRequest& request) {
   std::scoped_lock lock(mu_);
+  const uint64_t now = NowUnix();
+
+  auto cleanup = CleanupAuthState(now);
+  if (!cleanup.ok()) {
+    return Result<protocol::AuthFinishResponse>::Err(cleanup.error());
+  }
+  if (!IsValidUserId(request.user_id)) {
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "invalid_user_id");
+    return Result<protocol::AuthFinishResponse>::Err("invalid user_id");
+  }
+  if (!IsValidChallengeId(request.challenge_id)) {
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "invalid_challenge_id");
+    return Result<protocol::AuthFinishResponse>::Err("invalid challenge id");
+  }
+  if (request.client_nonce.size() != kExpectedAuthNonceBytes ||
+      request.server_nonce.size() != kExpectedAuthNonceBytes) {
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "invalid_nonce_size");
+    return Result<protocol::AuthFinishResponse>::Err("invalid auth nonce size");
+  }
+  if (request.signature_mldsa65.size() < kMinMlDsaSignatureBytes ||
+      request.signature_mldsa65.size() > kMaxMlDsaSignatureBytes) {
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "invalid_signature_size");
+    return Result<protocol::AuthFinishResponse>::Err("invalid auth signature size");
+  }
+  auto rate_limit = EnforceRateLimit(&auth_finish_attempts_,
+                                     request.user_id,
+                                     now,
+                                     kMaxAuthFinishAttemptsPerWindow,
+                                     kAuthRateWindowSeconds,
+                                     "auth finish rate limit exceeded");
+  if (!rate_limit.ok()) {
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "rate_limit");
+    return Result<protocol::AuthFinishResponse>::Err(rate_limit.error());
+  }
 
   auto begin = Begin(db_);
   if (!begin.ok()) {
@@ -421,6 +846,7 @@ Result<protocol::AuthFinishResponse> SqliteStore::FinishTransportAuthentication(
 
   if (sqlite3_step(challenge_stmt.get()) != SQLITE_ROW) {
     Rollback(db_);
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "unknown_challenge");
     return Result<protocol::AuthFinishResponse>::Err("unknown challenge");
   }
 
@@ -434,54 +860,24 @@ Result<protocol::AuthFinishResponse> SqliteStore::FinishTransportAuthentication(
 
   if (db_used) {
     Rollback(db_);
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "challenge_used");
     return Result<protocol::AuthFinishResponse>::Err("challenge already used");
   }
   if (NowUnix() > db_expires) {
     Rollback(db_);
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "challenge_expired");
     return Result<protocol::AuthFinishResponse>::Err("challenge expired");
   }
   if (db_user != request.user_id || db_client_nonce != request.client_nonce ||
       db_server_nonce != request.server_nonce ||
       db_expires != request.expires_at_unix) {
     Rollback(db_);
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "challenge_mismatch");
     return Result<protocol::AuthFinishResponse>::Err("challenge mismatch");
   }
 
-  auto account_result = Prepare(
-      db_,
-      "SELECT transport_auth_public_key FROM accounts WHERE user_id = ?;");
-  if (!account_result.ok()) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err(account_result.error());
-  }
-  auto account_stmt = account_result.take_value();
-  auto bind_account = BindText(account_stmt.get(), 1, request.user_id);
-  if (!bind_account.ok()) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err(bind_account.error());
-  }
-  if (sqlite3_step(account_stmt.get()) != SQLITE_ROW) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err("unknown user");
-  }
-  auto transport_auth_pub = ColumnBlob(account_stmt.get(), 0);
-
-  auto sign_input = protocol::BuildTransportAuthSignInput(
-      request.user_id,
-      request.client_nonce,
-      request.server_nonce,
-      request.challenge_id,
-      request.expires_at_unix);
-  auto verify = crypto::MlDsa65::Verify(transport_auth_pub,
-                                        sign_input,
-                                        request.signature_mldsa65);
-  if (!verify.ok()) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err("auth signature invalid");
-  }
-
   auto mark_used_result = Prepare(
-      db_, "UPDATE auth_challenges SET used = 1 WHERE challenge_id = ?;");
+      db_, "UPDATE auth_challenges SET used = 1 WHERE challenge_id = ? AND used = 0;");
   if (!mark_used_result.ok()) {
     Rollback(db_);
     return Result<protocol::AuthFinishResponse>::Err(mark_used_result.error());
@@ -497,55 +893,10 @@ Result<protocol::AuthFinishResponse> SqliteStore::FinishTransportAuthentication(
     Rollback(db_);
     return Result<protocol::AuthFinishResponse>::Err(step_mark.error());
   }
-
-  protocol::AuthFinishResponse response;
-  auto token = RandomBytes(32);
-  if (!token.ok()) {
+  if (sqlite3_changes(db_) != 1) {
     Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err(token.error());
-  }
-  response.session_token = token.take_value();
-  uint64_t now = NowUnix();
-  response.expires_at_unix = now + 900;
-
-  auto token_hash = HashToken(response.session_token);
-  if (!token_hash.ok()) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err(token_hash.error());
-  }
-
-  auto insert_session_result = Prepare(
-      db_,
-      "INSERT INTO sessions(token_hash, user_id, issued_at_unix, expires_at_unix, revoked) "
-      "VALUES(?, ?, ?, ?, 0);");
-  if (!insert_session_result.ok()) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err(insert_session_result.error());
-  }
-  auto insert_session_stmt = insert_session_result.take_value();
-  auto bind_token_hash = BindBlob(insert_session_stmt.get(), 1, token_hash.value());
-  if (!bind_token_hash.ok()) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err(bind_token_hash.error());
-  }
-  auto bind_session_user = BindText(insert_session_stmt.get(), 2, request.user_id);
-  if (!bind_session_user.ok()) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err(bind_session_user.error());
-  }
-  if (sqlite3_bind_int64(insert_session_stmt.get(), 3,
-                         static_cast<sqlite3_int64>(now)) != SQLITE_OK ||
-      sqlite3_bind_int64(insert_session_stmt.get(), 4,
-                         static_cast<sqlite3_int64>(response.expires_at_unix)) !=
-          SQLITE_OK) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err(
-        "bind session timestamps failed");
-  }
-  auto step_session = StepDone(db_, insert_session_stmt.get());
-  if (!step_session.ok()) {
-    Rollback(db_);
-    return Result<protocol::AuthFinishResponse>::Err(step_session.error());
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "challenge_used");
+    return Result<protocol::AuthFinishResponse>::Err("challenge already used");
   }
 
   auto commit = Commit(db_);
@@ -554,12 +905,97 @@ Result<protocol::AuthFinishResponse> SqliteStore::FinishTransportAuthentication(
     return Result<protocol::AuthFinishResponse>::Err(commit.error());
   }
 
+  auto account_result = Prepare(
+      db_,
+      "SELECT transport_auth_public_key FROM accounts WHERE user_id = ?;");
+  if (!account_result.ok()) {
+    return Result<protocol::AuthFinishResponse>::Err(account_result.error());
+  }
+  auto account_stmt = account_result.take_value();
+  auto bind_account = BindText(account_stmt.get(), 1, request.user_id);
+  if (!bind_account.ok()) {
+    return Result<protocol::AuthFinishResponse>::Err(bind_account.error());
+  }
+  if (sqlite3_step(account_stmt.get()) != SQLITE_ROW) {
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "unknown_user");
+    return Result<protocol::AuthFinishResponse>::Err("authentication failed");
+  }
+  auto transport_auth_pub = ColumnBlob(account_stmt.get(), 0);
+
+  auto sign_input = protocol::BuildTransportAuthSignInput(
+      request.user_id,
+      request.client_nonce,
+      request.server_nonce,
+      request.challenge_id,
+      request.expires_at_unix);
+  auto verify = crypto::MlDsa65::Verify(transport_auth_pub,
+                                        sign_input,
+                                        request.signature_mldsa65);
+  if (!verify.ok()) {
+    AppendAuthAudit(request.user_id, "auth_finish_rejected", "signature_invalid");
+    return Result<protocol::AuthFinishResponse>::Err("auth signature invalid");
+  }
+
+  protocol::AuthFinishResponse response;
+  auto token = RandomBytes(32);
+  if (!token.ok()) {
+    return Result<protocol::AuthFinishResponse>::Err(token.error());
+  }
+  response.session_token = token.take_value();
+  response.expires_at_unix = now + 900;
+
+  auto token_hash = HashToken(response.session_token);
+  if (!token_hash.ok()) {
+    return Result<protocol::AuthFinishResponse>::Err(token_hash.error());
+  }
+
+  auto insert_session_result = Prepare(
+      db_,
+      "INSERT INTO sessions(token_hash, user_id, issued_at_unix, expires_at_unix, revoked) "
+      "VALUES(?, ?, ?, ?, 0);");
+  if (!insert_session_result.ok()) {
+    return Result<protocol::AuthFinishResponse>::Err(insert_session_result.error());
+  }
+  auto insert_session_stmt = insert_session_result.take_value();
+  auto bind_token_hash = BindBlob(insert_session_stmt.get(), 1, token_hash.value());
+  if (!bind_token_hash.ok()) {
+    return Result<protocol::AuthFinishResponse>::Err(bind_token_hash.error());
+  }
+  auto bind_session_user = BindText(insert_session_stmt.get(), 2, request.user_id);
+  if (!bind_session_user.ok()) {
+    return Result<protocol::AuthFinishResponse>::Err(bind_session_user.error());
+  }
+  if (sqlite3_bind_int64(insert_session_stmt.get(), 3,
+                         static_cast<sqlite3_int64>(now)) != SQLITE_OK ||
+      sqlite3_bind_int64(insert_session_stmt.get(), 4,
+                         static_cast<sqlite3_int64>(response.expires_at_unix)) !=
+          SQLITE_OK) {
+    return Result<protocol::AuthFinishResponse>::Err(
+        "bind session timestamps failed");
+  }
+  auto step_session = StepDone(db_, insert_session_stmt.get());
+  if (!step_session.ok()) {
+    return Result<protocol::AuthFinishResponse>::Err(step_session.error());
+  }
+
+  AppendAuthAudit(request.user_id, "auth_finish_ok", "session_issued");
+
   return Result<protocol::AuthFinishResponse>::Ok(std::move(response));
 }
 
 Result<std::string> SqliteStore::AuthenticateSessionToken(
     const std::vector<uint8_t>& session_token) {
   std::scoped_lock lock(mu_);
+  const uint64_t now = NowUnix();
+
+  auto cleanup = CleanupAuthState(now);
+  if (!cleanup.ok()) {
+    return Result<std::string>::Err(cleanup.error());
+  }
+  if (session_token.size() != kExpectedSessionTokenBytes) {
+    AppendAuthAudit("unknown", "session_rejected", "invalid_token_size");
+    return Result<std::string>::Err("invalid session token size");
+  }
 
   auto token_hash = HashToken(session_token);
   if (!token_hash.ok()) {
@@ -579,6 +1015,7 @@ Result<std::string> SqliteStore::AuthenticateSessionToken(
   }
 
   if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
+    AppendAuthAudit("unknown", "session_rejected", "invalid_session");
     return Result<std::string>::Err("invalid session");
   }
 
@@ -588,17 +1025,82 @@ Result<std::string> SqliteStore::AuthenticateSessionToken(
   bool revoked = sqlite3_column_int(stmt.get(), 2) != 0;
 
   if (revoked) {
+    AppendAuthAudit(user, "session_rejected", "revoked");
     return Result<std::string>::Err("session revoked");
   }
-  if (NowUnix() > expires_at) {
+  if (now > expires_at) {
+    AppendAuthAudit(user, "session_rejected", "expired");
     return Result<std::string>::Err("session expired");
   }
 
+  AppendAuthAudit(user, "session_ok", "authenticated");
   return Result<std::string>::Ok(std::move(user));
+}
+
+Result<void> SqliteStore::RevokeSessionToken(
+    const std::vector<uint8_t>& session_token) {
+  std::scoped_lock lock(mu_);
+  if (session_token.size() != kExpectedSessionTokenBytes) {
+    AppendAuthAudit("unknown", "logout_rejected", "invalid_token_size");
+    return Result<void>::Err("invalid session token size");
+  }
+
+  auto token_hash = HashToken(session_token);
+  if (!token_hash.ok()) {
+    return Result<void>::Err(token_hash.error());
+  }
+
+  auto select_result = Prepare(db_, "SELECT user_id FROM sessions WHERE token_hash = ?;");
+  if (!select_result.ok()) {
+    return Result<void>::Err(select_result.error());
+  }
+  auto select_stmt = select_result.take_value();
+  auto bind_hash = BindBlob(select_stmt.get(), 1, token_hash.value());
+  if (!bind_hash.ok()) {
+    return bind_hash;
+  }
+  if (sqlite3_step(select_stmt.get()) != SQLITE_ROW) {
+    AppendAuthAudit("unknown", "logout_rejected", "invalid_session");
+    return Result<void>::Err("invalid session");
+  }
+  const unsigned char* user_text = sqlite3_column_text(select_stmt.get(), 0);
+  const std::string user = user_text ? reinterpret_cast<const char*>(user_text) : "unknown";
+
+  auto update_result =
+      Prepare(db_, "UPDATE sessions SET revoked = 1 WHERE token_hash = ?;");
+  if (!update_result.ok()) {
+    return Result<void>::Err(update_result.error());
+  }
+  auto update_stmt = update_result.take_value();
+  auto bind_update_hash = BindBlob(update_stmt.get(), 1, token_hash.value());
+  if (!bind_update_hash.ok()) {
+    return bind_update_hash;
+  }
+  auto step = StepDone(db_, update_stmt.get());
+  if (!step.ok()) {
+    return step;
+  }
+  if (sqlite3_changes(db_) != 1) {
+    AppendAuthAudit(user, "logout_rejected", "invalid_session");
+    return Result<void>::Err("invalid session");
+  }
+  AppendAuthAudit(user, "logout_ok", "session_revoked");
+  return Result<void>::Ok();
 }
 
 Result<void> SqliteStore::PublishBundle(const protocol::PrekeyBundle& bundle) {
   std::scoped_lock lock(mu_);
+
+  if (bundle.version != protocol::kProtocolVersion) {
+    return Result<void>::Err("unsupported bundle version");
+  }
+  if (bundle.cipher_suite != protocol::kCipherSuite) {
+    return Result<void>::Err("unsupported bundle cipher suite");
+  }
+  auto verify = protocol::VerifyPrekeyBundleSignatures(bundle);
+  if (!verify.ok()) {
+    return Result<void>::Err("invalid prekey bundle signatures: " + verify.error());
+  }
 
   auto begin = Begin(db_);
   if (!begin.ok()) {
@@ -611,8 +1113,9 @@ Result<void> SqliteStore::PublishBundle(const protocol::PrekeyBundle& bundle) {
       "user_id, identity_sign_public_key, identity_mldsa_public_key, identity_dh_public_key,"
       "spk_ec_id, spk_ec_public_key, spk_ec_sig_ed25519, spk_ec_sig_mldsa65,"
       "spk_pq_id, spk_pq_public_key, spk_pq_sig_ed25519, spk_pq_sig_mldsa65,"
+      "bundle_sig_ed25519, bundle_sig_mldsa65,"
       "version, cipher_suite"
-      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
       "ON CONFLICT(user_id) DO UPDATE SET "
       "identity_sign_public_key=excluded.identity_sign_public_key,"
       "identity_mldsa_public_key=excluded.identity_mldsa_public_key,"
@@ -625,6 +1128,8 @@ Result<void> SqliteStore::PublishBundle(const protocol::PrekeyBundle& bundle) {
       "spk_pq_public_key=excluded.spk_pq_public_key,"
       "spk_pq_sig_ed25519=excluded.spk_pq_sig_ed25519,"
       "spk_pq_sig_mldsa65=excluded.spk_pq_sig_mldsa65,"
+      "bundle_sig_ed25519=excluded.bundle_sig_ed25519,"
+      "bundle_sig_mldsa65=excluded.bundle_sig_mldsa65,"
       "version=excluded.version,"
       "cipher_suite=excluded.cipher_suite;");
   if (!stmt_result.ok()) {
@@ -698,6 +1203,18 @@ Result<void> SqliteStore::PublishBundle(const protocol::PrekeyBundle& bundle) {
     Rollback(db_);
     return bind_spk_pq_sig_ml;
   }
+  auto bind_bundle_sig_ed =
+      BindBlob(stmt.get(), idx++, bundle.bundle_signature_ed25519);
+  if (!bind_bundle_sig_ed.ok()) {
+    Rollback(db_);
+    return bind_bundle_sig_ed;
+  }
+  auto bind_bundle_sig_ml =
+      BindBlob(stmt.get(), idx++, bundle.bundle_signature_mldsa65);
+  if (!bind_bundle_sig_ml.ok()) {
+    Rollback(db_);
+    return bind_bundle_sig_ml;
+  }
   auto bind_version = BindText(stmt.get(), idx++, bundle.version);
   if (!bind_version.ok()) {
     Rollback(db_);
@@ -749,16 +1266,16 @@ Result<void> SqliteStore::PublishBundle(const protocol::PrekeyBundle& bundle) {
     return step_delete_pq;
   }
 
-  if (bundle.one_time_ec.has_value()) {
-    auto insert = InsertOneTimeEc(db_, bundle.user_id, *bundle.one_time_ec);
+  for (const auto& one_time_ec : bundle.one_time_ec) {
+    auto insert = InsertOneTimeEc(db_, bundle.user_id, one_time_ec);
     if (!insert.ok()) {
       Rollback(db_);
       return insert;
     }
   }
 
-  if (bundle.one_time_pq.has_value()) {
-    auto insert = InsertOneTimePq(db_, bundle.user_id, *bundle.one_time_pq);
+  for (const auto& one_time_pq : bundle.one_time_pq) {
+    auto insert = InsertOneTimePq(db_, bundle.user_id, one_time_pq);
     if (!insert.ok()) {
       Rollback(db_);
       return insert;
@@ -788,6 +1305,7 @@ Result<protocol::PrekeyBundle> SqliteStore::AcquireBundleForSession(
       "SELECT identity_sign_public_key, identity_mldsa_public_key, identity_dh_public_key,"
       "spk_ec_id, spk_ec_public_key, spk_ec_sig_ed25519, spk_ec_sig_mldsa65,"
       "spk_pq_id, spk_pq_public_key, spk_pq_sig_ed25519, spk_pq_sig_mldsa65,"
+      "bundle_sig_ed25519, bundle_sig_mldsa65,"
       "version, cipher_suite "
       "FROM bundles WHERE user_id = ?;");
   if (!stmt_result.ok()) {
@@ -820,9 +1338,11 @@ Result<protocol::PrekeyBundle> SqliteStore::AcquireBundleForSession(
   bundle.signed_prekey_pq.public_key = ColumnBlob(stmt.get(), 8);
   bundle.signed_prekey_pq.signature_ed25519 = ColumnBlob(stmt.get(), 9);
   bundle.signed_prekey_pq.signature_mldsa65 = ColumnBlob(stmt.get(), 10);
+  bundle.bundle_signature_ed25519 = ColumnBlob(stmt.get(), 11);
+  bundle.bundle_signature_mldsa65 = ColumnBlob(stmt.get(), 12);
 
-  const unsigned char* version = sqlite3_column_text(stmt.get(), 11);
-  const unsigned char* suite = sqlite3_column_text(stmt.get(), 12);
+  const unsigned char* version = sqlite3_column_text(stmt.get(), 13);
+  const unsigned char* suite = sqlite3_column_text(stmt.get(), 14);
   bundle.version = version ? reinterpret_cast<const char*>(version) : "";
   bundle.cipher_suite = suite ? reinterpret_cast<const char*>(suite) : "";
 
@@ -839,29 +1359,15 @@ Result<protocol::PrekeyBundle> SqliteStore::AcquireBundleForSession(
     return Result<protocol::PrekeyBundle>::Err(bind_ec_user.error());
   }
 
+  bool has_ec = false;
+  int64_t ec_rowid = 0;
+  protocol::OneTimePrekeyEc selected_ec;
   int ec_rc = sqlite3_step(ec_stmt.get());
   if (ec_rc == SQLITE_ROW) {
-    sqlite3_int64 rowid = sqlite3_column_int64(ec_stmt.get(), 0);
-    protocol::OneTimePrekeyEc opk;
-    opk.id = static_cast<uint32_t>(sqlite3_column_int64(ec_stmt.get(), 1));
-    opk.public_key = ColumnBlob(ec_stmt.get(), 2);
-    bundle.one_time_ec = opk;
-
-    auto del_stmt_result = Prepare(db_, "DELETE FROM one_time_ec WHERE rowid = ?;");
-    if (!del_stmt_result.ok()) {
-      Rollback(db_);
-      return Result<protocol::PrekeyBundle>::Err(del_stmt_result.error());
-    }
-    auto del_stmt = del_stmt_result.take_value();
-    if (sqlite3_bind_int64(del_stmt.get(), 1, rowid) != SQLITE_OK) {
-      Rollback(db_);
-      return Result<protocol::PrekeyBundle>::Err("delete one_time_ec bind failed");
-    }
-    auto step_del = StepDone(db_, del_stmt.get());
-    if (!step_del.ok()) {
-      Rollback(db_);
-      return Result<protocol::PrekeyBundle>::Err(step_del.error());
-    }
+    has_ec = true;
+    ec_rowid = sqlite3_column_int64(ec_stmt.get(), 0);
+    selected_ec.id = static_cast<uint32_t>(sqlite3_column_int64(ec_stmt.get(), 1));
+    selected_ec.public_key = ColumnBlob(ec_stmt.get(), 2);
   } else if (ec_rc != SQLITE_DONE) {
     Rollback(db_);
     return Result<protocol::PrekeyBundle>::Err(sqlite3_errmsg(db_));
@@ -880,32 +1386,57 @@ Result<protocol::PrekeyBundle> SqliteStore::AcquireBundleForSession(
     return Result<protocol::PrekeyBundle>::Err(bind_pq_user.error());
   }
 
+  bool has_pq = false;
+  int64_t pq_rowid = 0;
+  protocol::OneTimePrekeyPq selected_pq;
   int pq_rc = sqlite3_step(pq_stmt.get());
   if (pq_rc == SQLITE_ROW) {
-    sqlite3_int64 rowid = sqlite3_column_int64(pq_stmt.get(), 0);
-    protocol::OneTimePrekeyPq opk;
-    opk.id = static_cast<uint32_t>(sqlite3_column_int64(pq_stmt.get(), 1));
-    opk.public_key = ColumnBlob(pq_stmt.get(), 2);
-    bundle.one_time_pq = opk;
-
-    auto del_stmt_result = Prepare(db_, "DELETE FROM one_time_pq WHERE rowid = ?;");
-    if (!del_stmt_result.ok()) {
-      Rollback(db_);
-      return Result<protocol::PrekeyBundle>::Err(del_stmt_result.error());
-    }
-    auto del_stmt = del_stmt_result.take_value();
-    if (sqlite3_bind_int64(del_stmt.get(), 1, rowid) != SQLITE_OK) {
-      Rollback(db_);
-      return Result<protocol::PrekeyBundle>::Err("delete one_time_pq bind failed");
-    }
-    auto step_del = StepDone(db_, del_stmt.get());
-    if (!step_del.ok()) {
-      Rollback(db_);
-      return Result<protocol::PrekeyBundle>::Err(step_del.error());
-    }
+    has_pq = true;
+    pq_rowid = sqlite3_column_int64(pq_stmt.get(), 0);
+    selected_pq.id = static_cast<uint32_t>(sqlite3_column_int64(pq_stmt.get(), 1));
+    selected_pq.public_key = ColumnBlob(pq_stmt.get(), 2);
   } else if (pq_rc != SQLITE_DONE) {
     Rollback(db_);
     return Result<protocol::PrekeyBundle>::Err(sqlite3_errmsg(db_));
+  }
+
+  if (has_ec && has_pq) {
+    bundle.one_time_ec.push_back(std::move(selected_ec));
+    bundle.one_time_pq.push_back(std::move(selected_pq));
+
+    auto delete_ec = Prepare(db_, "DELETE FROM one_time_ec WHERE rowid = ?;");
+    if (!delete_ec.ok()) {
+      Rollback(db_);
+      return Result<protocol::PrekeyBundle>::Err(delete_ec.error());
+    }
+    auto delete_ec_stmt = delete_ec.take_value();
+    if (sqlite3_bind_int64(delete_ec_stmt.get(), 1, static_cast<sqlite3_int64>(ec_rowid)) !=
+        SQLITE_OK) {
+      Rollback(db_);
+      return Result<protocol::PrekeyBundle>::Err("bind one-time ec row delete failed");
+    }
+    auto delete_ec_step = StepDone(db_, delete_ec_stmt.get());
+    if (!delete_ec_step.ok()) {
+      Rollback(db_);
+      return Result<protocol::PrekeyBundle>::Err(delete_ec_step.error());
+    }
+
+    auto delete_pq = Prepare(db_, "DELETE FROM one_time_pq WHERE rowid = ?;");
+    if (!delete_pq.ok()) {
+      Rollback(db_);
+      return Result<protocol::PrekeyBundle>::Err(delete_pq.error());
+    }
+    auto delete_pq_stmt = delete_pq.take_value();
+    if (sqlite3_bind_int64(delete_pq_stmt.get(), 1, static_cast<sqlite3_int64>(pq_rowid)) !=
+        SQLITE_OK) {
+      Rollback(db_);
+      return Result<protocol::PrekeyBundle>::Err("bind one-time pq row delete failed");
+    }
+    auto delete_pq_step = StepDone(db_, delete_pq_stmt.get());
+    if (!delete_pq_step.ok()) {
+      Rollback(db_);
+      return Result<protocol::PrekeyBundle>::Err(delete_pq_step.error());
+    }
   }
 
   auto commit = Commit(db_);
@@ -945,30 +1476,65 @@ Result<void> SqliteStore::EnqueueEnvelope(const std::string& user_id,
   return StepDone(db_, stmt.get());
 }
 
-Result<std::vector<protocol::Envelope>> SqliteStore::DrainInbox(
-    const std::string& user_id) {
+Result<std::vector<protocol::InboxEnvelope>> SqliteStore::DrainInbox(
+    const std::string& user_id,
+    std::optional<uint64_t> ack_up_to_inbox_id) {
   std::scoped_lock lock(mu_);
 
   auto begin = Begin(db_);
   if (!begin.ok()) {
-    return Result<std::vector<protocol::Envelope>>::Err(begin.error());
+    return Result<std::vector<protocol::InboxEnvelope>>::Err(begin.error());
+  }
+
+  if (ack_up_to_inbox_id.has_value()) {
+    auto ack_result = Prepare(db_, "DELETE FROM inbox WHERE user_id = ? AND id <= ?;");
+    if (!ack_result.ok()) {
+      Rollback(db_);
+      return Result<std::vector<protocol::InboxEnvelope>>::Err(ack_result.error());
+    }
+    auto ack_stmt = ack_result.take_value();
+    auto bind_ack_user = BindText(ack_stmt.get(), 1, user_id);
+    if (!bind_ack_user.ok()) {
+      Rollback(db_);
+      return Result<std::vector<protocol::InboxEnvelope>>::Err(bind_ack_user.error());
+    }
+    if (sqlite3_bind_int64(ack_stmt.get(), 2,
+                           static_cast<sqlite3_int64>(*ack_up_to_inbox_id)) !=
+        SQLITE_OK) {
+      Rollback(db_);
+      return Result<std::vector<protocol::InboxEnvelope>>::Err(
+          "bind inbox ack id failed");
+    }
+    auto ack_step = StepDone(db_, ack_stmt.get());
+    if (!ack_step.ok()) {
+      Rollback(db_);
+      return Result<std::vector<protocol::InboxEnvelope>>::Err(ack_step.error());
+    }
   }
 
   auto select_result =
-      Prepare(db_, "SELECT envelope FROM inbox WHERE user_id = ? ORDER BY id;");
+      Prepare(db_, "SELECT id, envelope FROM inbox WHERE user_id = ? ORDER BY id LIMIT ?;");
   if (!select_result.ok()) {
     Rollback(db_);
-    return Result<std::vector<protocol::Envelope>>::Err(select_result.error());
+    return Result<std::vector<protocol::InboxEnvelope>>::Err(select_result.error());
   }
   auto select_stmt = select_result.take_value();
 
   auto bind_user = BindText(select_stmt.get(), 1, user_id);
   if (!bind_user.ok()) {
     Rollback(db_);
-    return Result<std::vector<protocol::Envelope>>::Err(bind_user.error());
+    return Result<std::vector<protocol::InboxEnvelope>>::Err(bind_user.error());
+  }
+  if (sqlite3_bind_int64(select_stmt.get(), 2,
+                         static_cast<sqlite3_int64>(kMaxDrainInboxBatchItems)) !=
+      SQLITE_OK) {
+    Rollback(db_);
+    return Result<std::vector<protocol::InboxEnvelope>>::Err(
+        "bind inbox drain limit failed");
   }
 
-  std::vector<protocol::Envelope> out;
+  std::vector<protocol::InboxEnvelope> out;
+  size_t total_payload_bytes = 0;
   while (true) {
     int rc = sqlite3_step(select_stmt.get());
     if (rc == SQLITE_DONE) {
@@ -976,44 +1542,31 @@ Result<std::vector<protocol::Envelope>> SqliteStore::DrainInbox(
     }
     if (rc != SQLITE_ROW) {
       Rollback(db_);
-      return Result<std::vector<protocol::Envelope>>::Err(sqlite3_errmsg(db_));
+      return Result<std::vector<protocol::InboxEnvelope>>::Err(sqlite3_errmsg(db_));
     }
 
-    auto payload = ColumnBlob(select_stmt.get(), 0);
+    uint64_t inbox_id = static_cast<uint64_t>(sqlite3_column_int64(select_stmt.get(), 0));
+    auto payload = ColumnBlob(select_stmt.get(), 1);
+    size_t estimated_size = payload.size() + sizeof(uint64_t) + 8;
+    if (!out.empty() && total_payload_bytes + estimated_size > kMaxDrainInboxBatchBytes) {
+      break;
+    }
     auto envelope = protocol::DeserializeEnvelope(payload);
     if (!envelope.ok()) {
       Rollback(db_);
-      return Result<std::vector<protocol::Envelope>>::Err(envelope.error());
+      return Result<std::vector<protocol::InboxEnvelope>>::Err(envelope.error());
     }
-    out.push_back(envelope.take_value());
-  }
-
-  auto delete_result = Prepare(db_, "DELETE FROM inbox WHERE user_id = ?;");
-  if (!delete_result.ok()) {
-    Rollback(db_);
-    return Result<std::vector<protocol::Envelope>>::Err(delete_result.error());
-  }
-  auto delete_stmt = delete_result.take_value();
-
-  auto bind_delete_user = BindText(delete_stmt.get(), 1, user_id);
-  if (!bind_delete_user.ok()) {
-    Rollback(db_);
-    return Result<std::vector<protocol::Envelope>>::Err(bind_delete_user.error());
-  }
-
-  auto step_delete = StepDone(db_, delete_stmt.get());
-  if (!step_delete.ok()) {
-    Rollback(db_);
-    return Result<std::vector<protocol::Envelope>>::Err(step_delete.error());
+    total_payload_bytes += estimated_size;
+    out.push_back(protocol::InboxEnvelope{inbox_id, envelope.take_value()});
   }
 
   auto commit = Commit(db_);
   if (!commit.ok()) {
     Rollback(db_);
-    return Result<std::vector<protocol::Envelope>>::Err(commit.error());
+    return Result<std::vector<protocol::InboxEnvelope>>::Err(commit.error());
   }
 
-  return Result<std::vector<protocol::Envelope>>::Ok(std::move(out));
+  return Result<std::vector<protocol::InboxEnvelope>>::Ok(std::move(out));
 }
 
 }  // namespace pqchat::server

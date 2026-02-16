@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,9 @@ class IServerApi {
   virtual Result<std::string> AuthenticateSessionToken(
       const std::vector<uint8_t>& session_token) = 0;
 
+  virtual Result<void> RevokeSessionToken(
+      const std::vector<uint8_t>& session_token) = 0;
+
   virtual Result<void> PublishBundle(const protocol::PrekeyBundle& bundle) = 0;
 
   virtual Result<protocol::PrekeyBundle> AcquireBundleForSession(
@@ -34,8 +38,9 @@ class IServerApi {
   virtual Result<void> EnqueueEnvelope(const std::string& user_id,
                                        protocol::Envelope envelope) = 0;
 
-  virtual Result<std::vector<protocol::Envelope>> DrainInbox(
-      const std::string& user_id) = 0;
+  virtual Result<std::vector<protocol::InboxEnvelope>> DrainInbox(
+      const std::string& user_id,
+      std::optional<uint64_t> ack_up_to_inbox_id = std::nullopt) = 0;
 };
 
 }  // namespace pqchat::server

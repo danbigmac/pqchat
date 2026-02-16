@@ -138,7 +138,7 @@ This gives first-draft post-compromise recovery better than a pure symmetric cha
 
 ### Responsibilities
 - Store/fetch prekey bundles
-- Atomically hand out and consume one-time prekeys
+- Serve publisher-signed one-time prekey lists; responder clients consume referenced IDs locally and republish refreshed bundles
 - Store encrypted envelopes by recipient
 - Return envelopes in order with monotonic server sequence IDs
 - Authenticate transport API callers and bind API actions to authenticated user identity

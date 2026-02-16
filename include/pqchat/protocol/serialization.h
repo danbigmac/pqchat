@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,6 +18,11 @@ struct EnqueueRequest {
   Envelope envelope;
 };
 
+struct DrainInboxRequest {
+  std::string user_id;
+  std::optional<uint64_t> ack_up_to_inbox_id;
+};
+
 Result<std::vector<uint8_t>> SerializePrekeyBundle(const PrekeyBundle& bundle);
 Result<PrekeyBundle> DeserializePrekeyBundle(const std::vector<uint8_t>& bytes);
 
@@ -28,12 +34,22 @@ Result<std::vector<uint8_t>> SerializeEnvelopeVector(
 Result<std::vector<Envelope>> DeserializeEnvelopeVector(
     const std::vector<uint8_t>& bytes);
 
+Result<std::vector<uint8_t>> SerializeInboxEnvelopeVector(
+    const std::vector<InboxEnvelope>& envelopes);
+Result<std::vector<InboxEnvelope>> DeserializeInboxEnvelopeVector(
+    const std::vector<uint8_t>& bytes);
+
 Result<std::vector<uint8_t>> SerializeString(const std::string& value);
 Result<std::string> DeserializeString(const std::vector<uint8_t>& bytes);
 
 Result<std::vector<uint8_t>> SerializeEnqueueRequest(
     const EnqueueRequest& request);
 Result<EnqueueRequest> DeserializeEnqueueRequest(
+    const std::vector<uint8_t>& bytes);
+
+Result<std::vector<uint8_t>> SerializeDrainInboxRequest(
+    const DrainInboxRequest& request);
+Result<DrainInboxRequest> DeserializeDrainInboxRequest(
     const std::vector<uint8_t>& bytes);
 
 Result<std::vector<uint8_t>> SerializeRegisterRequest(
