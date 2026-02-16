@@ -1,4 +1,5 @@
 # pqchat (first draft)
+NOTE: this was coded up with HEAVY use of Codex CLI.
 
 Two-party chat prototype with Signal-style structure and hybrid post-quantum handshake/authentication.
 
